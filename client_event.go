@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"time"
 
 	"github.com/WinterChocolates/YukiChoco/event"
@@ -19,6 +20,14 @@ const (
 	EventSourceNone EventSourceKind = "none"
 	// EventSourceWS 表示通过 WebSocket（GET /event）接收事件。
 	EventSourceWS EventSourceKind = "ws"
+	// EventSourceSSE 表示通过 Server-Sent Events（GET /event）接收事件。
+	//
+	// 适合 WebSocket 被中间设备阻断的环境；注意 SSE 是单向流，出错后整条连接重建。
+	EventSourceSSE EventSourceKind = "sse"
+	// EventSourceWebhook 表示由协议端 POST 到应用端（配合 Client.EventHandler）。
+	//
+	// 该模式需要应用端可被协议端访问，且不提供断线重连语义。
+	EventSourceWebhook EventSourceKind = "webhook"
 )
 
 // stateHook 与 rawHook 是回调注册记录。
@@ -373,3 +382,27 @@ func (c *Client) fireState(s State) {
 
 // markReady 关闭 ready 通道（仅一次）。
 func (c *Client) markReady() { c.readyOnce.Do(func() { close(c.ready) }) }
+
+// EventHandler 返回 WebHook 事件接收器。
+//
+// 仅在 Config.EventSource == EventSourceWebhook 时可用；其余模式下返回的
+// handler 一律回应 501，便于在错误的挂载路径上快速暴露配置问题。
+//
+//	mux.Handle("/milky/event", c.EventHandler())
+func (c *Client) EventHandler() http.Handler {
+	if c.webhook == nil {
+		return http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+			http.Error(rw, "milky: 当前未启用 WebHook 事件源（Config.EventSource 应为 EventSourceWebhook）",
+				http.StatusNotImplemented)
+		})
+	}
+	return c.webhook.Handler()
+}
+
+// WebhookDropped 返回 WebHook 因队列满拒绝的事件数。
+func (c *Client) WebhookDropped() uint64 {
+	if c.webhook == nil {
+		return 0
+	}
+	return c.webhook.Dropped()
+}

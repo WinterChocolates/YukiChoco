@@ -27,6 +27,7 @@ type Client struct {
 
 	events      *event.Dispatcher
 	eventSource transport.Source
+	webhook     *transport.WebHook
 
 	mu          sync.RWMutex
 	selfID      types.UserID
@@ -96,6 +97,23 @@ func New(cfg Config) (*Client, error) {
 			MaxMessageBytes: cfg.MaxResponseBytes,
 			Logger:          cfg.Logger,
 		})
+	case EventSourceSSE:
+		c.eventSource = transport.NewSSE(transport.SSEConfig{
+			URL:             cfg.EventURL,
+			AccessToken:     cfg.AccessToken,
+			HTTPClient:      cfg.HTTPClient,
+			IdleTimeout:     cfg.IdleTimeout,
+			MaxMessageBytes: cfg.MaxResponseBytes,
+			Logger:          cfg.Logger,
+		})
+	case EventSourceWebhook:
+		c.webhook = transport.NewWebHook(transport.WebHookConfig{
+			AccessToken: cfg.AccessToken,
+			VerifyToken: cfg.WebHookVerifyToken,
+			Buffer:      cfg.WebHookBuffer,
+			Logger:      cfg.Logger,
+		})
+		c.eventSource = c.webhook
 	}
 	go c.notifyStates()
 	c.system = newSystemService(c)
@@ -193,6 +211,9 @@ func (c *Client) Close() error {
 
 	if cancel != nil {
 		cancel()
+	}
+	if c.webhook != nil {
+		_ = c.webhook.Close()
 	}
 	if c.ownsHTTP {
 		c.http.CloseIdleConnections()

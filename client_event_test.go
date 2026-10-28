@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -439,29 +438,38 @@ func TestDispatchModesViaConfig(t *testing.T) {
 
 func TestEventURLDerivation(t *testing.T) {
 	cases := []struct {
-		base string
+		name string
+		cfg  Config
 		want string
 	}{
-		{"http://127.0.0.1:6700", "ws://127.0.0.1:6700/event"},
-		{"https://bot.example.com", "wss://bot.example.com/event"},
-		{"http://bot.example.com/milky/", "ws://bot.example.com/milky/event"},
+		{"ws http", Config{BaseURL: "http://127.0.0.1:6700"}, "ws://127.0.0.1:6700/event"},
+		{"ws https", Config{BaseURL: "https://bot.example.com"}, "wss://bot.example.com/event"},
+		{"ws 带路径", Config{BaseURL: "http://bot.example.com/milky/"}, "ws://bot.example.com/milky/event"},
+		{"sse", Config{BaseURL: "http://127.0.0.1:6700", EventSource: EventSourceSSE}, "http://127.0.0.1:6700/event"},
+		{"sse https", Config{BaseURL: "https://bot.example.com", EventSource: EventSourceSSE}, "https://bot.example.com/event"},
+		{"webhook", Config{BaseURL: "http://127.0.0.1:6700", EventSource: EventSourceWebhook}, ""},
 	}
 	for _, tc := range cases {
-		c, err := New(Config{BaseURL: tc.base})
-		if err != nil {
-			t.Fatalf("New(%s): %v", tc.base, err)
-		}
-		if got := c.Config().EventURL; got != tc.want {
-			t.Errorf("EventURL(%s) = %s, want %s", tc.base, got, tc.want)
-		}
-		_ = c.Close()
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := New(tc.cfg)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer c.Close()
+			if got := c.Config().EventURL; got != tc.want {
+				t.Errorf("EventURL = %q, want %q", got, tc.want)
+			}
+		})
 	}
 
-	if _, err := New(Config{BaseURL: "http://x", EventSource: "sse"}); err == nil ||
-		!strings.Contains(err.Error(), "不支持的事件源") {
-		t.Errorf("未支持的事件源应报错，err = %v", err)
+	bad := []Config{
+		{BaseURL: "http://x", EventSource: "mqtt"},
+		{BaseURL: "http://x", EventURL: "http://x/event"},                            // WS 需要 ws/wss
+		{BaseURL: "http://x", EventSource: EventSourceSSE, EventURL: "ws://x/event"}, // SSE 需要 http(s)
 	}
-	if _, err := New(Config{BaseURL: "http://x", EventURL: "http://x/event"}); err == nil {
-		t.Error("EventURL 的 scheme 必须是 ws/wss")
+	for i, cfg := range bad {
+		if _, err := New(cfg); err == nil {
+			t.Errorf("case %d 应报错: %+v", i, cfg)
+		}
 	}
 }

@@ -83,6 +83,15 @@ type Config struct {
 
 	// Dispatch 控制事件分发。
 	Dispatch DispatchConfig
+
+	// WebHookVerifyToken 为 true 时校验 WebHook 请求的
+	// `Authorization: Bearer <AccessToken>`。仅 EventSourceWebhook 有效。
+	//
+	// 协议端不保证发送该头，因此默认关闭；公网部署时建议打开并配合 IP 白名单。
+	WebHookVerifyToken bool
+
+	// WebHookBuffer 是 WebHook 事件队列容量。零值默认 256。
+	WebHookBuffer int
 }
 
 // ReconnectConfig 控制事件通道的自动重连。
@@ -266,9 +275,23 @@ func (c *Config) validate() error {
 				return fmt.Errorf("milky: Config.EventURL 的 scheme 必须是 ws 或 wss，实际为 %q", u.Scheme)
 			}
 		}
+	case EventSourceSSE:
+		if c.EventURL == "" {
+			c.EventURL = c.BaseURL + "/event"
+		}
+		u, err := url.Parse(c.EventURL)
+		if err != nil {
+			return fmt.Errorf("milky: Config.EventURL 不是合法 URL: %w", err)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("milky: SSE 的 Config.EventURL 必须是 http(s)，实际为 %q", u.Scheme)
+		}
+	case EventSourceWebhook:
+		// 事件由协议端推送到调用方挂载的 Client.EventHandler，无需出站地址。
+		c.EventURL = ""
 	default:
-		return fmt.Errorf("milky: 不支持的事件源 %q（当前支持 %q / %q）",
-			c.EventSource, EventSourceWS, EventSourceNone)
+		return fmt.Errorf("milky: 不支持的事件源 %q（支持 %q / %q / %q / %q）",
+			c.EventSource, EventSourceWS, EventSourceSSE, EventSourceWebhook, EventSourceNone)
 	}
 	return nil
 }
