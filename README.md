@@ -10,7 +10,7 @@ import "github.com/WinterChocolates/YukiChoco"
 - **应用端**：本 SDK（通过 HTTP 调 `/api/{endpoint}`，通过 WebSocket / SSE / WebHook 收事件）
 - **不是**：QQ 协议实现、bot 框架（无插件/权限系统）、OneBot 兼容层
 
-> 当前状态：**M0–M2 已完成** —— IR 生成的协议数据模型、HTTP API 调用层（65 个强类型方法 + `Call` 逃生舱）、WebSocket 事件通道（状态机 + 自动重连 + 分发器 + 泛型订阅 + 中间件）。SSE / WebHook 与 `segment` DSL 在 M3。见 [Roadmap](#roadmap)。
+> 当前状态：**M0–M3 已完成** —— IR 生成的协议数据模型、HTTP API 调用层（65 个强类型方法 + `Call` 逃生舱）、三种事件通道（WebSocket / SSE / WebHook）、状态机与自动重连、可插拔分发器、`segment` 构造助手、可编程假协议端与 4 个示例。M4 为真机 e2e、benchmark 与 v0.1.0 发布。见 [Roadmap](#roadmap)。
 
 ---
 
@@ -22,9 +22,11 @@ import "github.com/WinterChocolates/YukiChoco"
 | 类型由 IR 生成 | 不存在手抄字段；协议升级只需 `make generate`，字段级 `since` / 默认值全部保留 |
 | 宽容解码 | 未知事件、未知消息段、未知枚举值**原样透传**，不因协议端升级而崩；数组中的非法元素被跳过 |
 | 语义化 ID | `UserID` / `GroupID` / `Uin` / `MessageSeq` 各自独立类型，编译期阻断群号与 QQ 号串用 |
-| 零第三方依赖 | 当前仅标准库；WebSocket 在 M2 引入 `gorilla/websocket` |
+| 依赖极小 | 生产依赖只有 `gorilla/websocket`（SSE/WebHook 用标准库实现） |
 | API 调用层 | 65 个强类型方法挂在 5 个 service 上（`c.Group().SendMessage(...)`），`context` 全链路，统一信封解析与 `retcode` 归类 |
-| 事件通道 | WebSocket 事件源（ping/pong + 读超时，**不发**应用层心跳）、连接状态机、指数退避重连、可注入 dialer（代理/TLS） |
+| 三种事件通道 | **WebSocket**（ping/pong + 读超时，不发应用层心跳）/ **SSE**（含多行 data、注释保活）/ **WebHook**（`http.Handler`，可选 `Authorization` 校验）；统一状态机 + 指数退避重连 |
+| 消息构造 | `segment` 包：`Text` / `Mention` / `Reply` / `ImageFromFile` / `Forward` …；`file://`、`base64://`、`http(s)://` 自动识别与 8 MiB 内联上限 |
+| 可测试 | `mock` 包提供可编程假协议端（API + WS/SSE 推送），无需真实 QQ 账号即可跑集成测试 |
 | 分发策略 | 并发 / 全局有序 / **按会话有序**（同群有序、跨群并行）；队列满可丢弃或阻塞；panic 隔离；泛型 `YukiChoco.On[T]` 订阅 + 中间件链 |
 | 可校验 | golden 测试锁定生成物、AST 校验方法覆盖度、负例测试阻断协议漂移、`-race` 全绿 |
 
@@ -87,21 +89,33 @@ func handle(payload []byte) error {
 ### 2. 构造发送消息（现在即可用）
 
 ```go
+import (
+	"github.com/WinterChocolates/YukiChoco/segment"
+	"github.com/WinterChocolates/YukiChoco/types"
+)
+
 segs := types.OutgoingSegments{
-	&types.OutgoingReplySegment{MessageSeq: 23333},
-	&types.OutgoingTextSegment{Text: "你好，"},
-	&types.OutgoingMentionSegment{UserID: 111222333},
-	&types.OutgoingImageSegment{URI: "file:///tmp/a.png"},
+	segment.Reply(23333),
+	segment.Text("你好，"),
+	segment.Mention(111222333),
+	segment.Image("file:///tmp/a.png"),
 }
 
-raw, err := json.Marshal(segs)
-// [{"type":"reply","data":{"message_seq":23333}},
-//  {"type":"text","data":{"text":"你好，"}},
-//  {"type":"mention","data":{"user_id":111222333}},
-//  {"type":"image","data":{"uri":"file:///tmp/a.png"}}]
+// 本地文件 / 内存数据 / io.Reader 都可以，超过 8 MiB 会提示改用 file:// 或 URL
+img, err := segment.ImageFromFile("/tmp/b.png")
+audio, err := segment.ImageFromReader(reader)
 ```
 
-`uri` 支持 `file://`、`http(s)://`、`base64://` 三种形式（M3 会提供 `segment.ImageFromFile` 等助手）。
+序列化结果：
+
+```json
+[{"type":"reply","data":{"message_seq":23333}},
+ {"type":"text","data":{"text":"你好，"}},
+ {"type":"mention","data":{"user_id":111222333}},
+ {"type":"image","data":{"uri":"file:///tmp/a.png"}}]
+```
+
+`uri` 支持 `file://`、`http(s)://`、`base64://`；`segment.URI(src)` 可直接把本地路径 / `[]byte` / `io.Reader` 转成合适的 URI。
 
 ### 3. 调用 API（M1 起可用）
 
@@ -242,17 +256,34 @@ select {} // 或用 signal.NotifyContext 等待退出信号
 
 **事件语义**：Milky 没有 ack 与序号重放，事件通道断开期间的事件会**丢失**，重连后不补发。需要严格不丢时请用 `BackpressureBlock` 并配合 `get_history_messages` 对账。
 
+### 5. 示例
+
+```bash
+MILKY_BASE_URL=http://127.0.0.1:6700 MILKY_TOKEN=xxx go run ./examples/echo-bot
+MILKY_BASE_URL=http://127.0.0.1:6700 MILKY_TOKEN=xxx LISTEN=:8080 go run ./examples/webhook-bot
+MILKY_BASE_URL=http://127.0.0.1:6700 MILKY_TOKEN=xxx go run ./examples/sse-client
+MILKY_BASE_URL=http://127.0.0.1:6700 MILKY_TOKEN=xxx go run ./examples/admin-bot
+```
+
+| 示例 | 演示内容 |
+| --- | --- |
+| `echo-bot` | WS + `Init` + `On` + 引用回复 |
+| `webhook-bot` | `EventSourceWebhook` + `http.Handler` 挂载 + 优雅关闭 |
+| `sse-client` | `EventSourceSSE`、中间件、状态回调、运行统计 |
+| `admin-bot` | 谓词路由（`AtMe().Admin().Prefix()`）、禁言/撤回/公告/上传群文件 |
+
 ---
 
 ## 包结构
 
 ```
-github.com/WinterChocolates/YukiChoco     package YukiChoco  ← Client / Config / 5 个 service / 事件分发（M2）
-├── types                                 协议数据模型：实体 / 事件 / 消息段 / API 模型（已可用）
-├── event                                 事件分发（并发/有序/按会话）、泛型 On[T]、中间件（已可用）
-├── transport                             事件源抽象 + WebSocket 实现（已可用）；SSE/WebHook（M3）
-├── segment                               消息段构造 DSL、媒体 uri 助手（M3）
-├── mock                                  可编程假协议端，用于测试（M3）
+github.com/WinterChocolates/YukiChoco     package YukiChoco  ← Client / Config / 5 个 service / 生命周期
+├── types                                 协议数据模型：实体 / 事件 / 消息段 / API 模型
+├── event                                 分发器（并发/有序/按会话）、泛型 On[T]、中间件、谓词路由
+├── transport                             事件源抽象 + WS / SSE / WebHook 实现
+├── segment                               消息段构造助手、资源 URI（file/base64/http）
+├── mock                                  可编程假协议端（API + WS/SSE），用于测试
+├── examples/                             echo-bot / webhook-bot / sse-client / admin-bot
 ├── internal/jsonx                        宽容整数、Tagged 编解码、跳过非法元素
 ├── internal/codegen                      Milky IR → Go（生成器本身）
 └── protocol/protocol-1.3.0.json          锁定的 Milky IR（sha256 2df17982…）
@@ -301,7 +332,8 @@ go test -race ./...
 | ID 精度 | 一律 `int64` 语义化类型；解码接受数字或数字字符串，拒绝浮点；编码始终输出 JSON 数字 |
 | 未知内容 | `UnknownEvent` / `UnknownIncomingSegment` / `UnknownIncomingMessage` 保留原始 JSON，序列化原样回填 |
 | 数组容错 | 消息段列表逐元素解码，坏元素上报后跳过，不影响整条消息 |
-| 心跳 | 不使用应用层心跳帧（Milky 协议里没有），只用 WebSocket ping/pong + 读超时 |
+| 心跳 | 不使用应用层心跳帧（Milky 协议里没有），只用 WebSocket ping/pong + 读超时；SSE 用读空闲超时 |
+| WebHook 鉴权 | 协议端不保证发送 `Authorization` 头，因此 `WebHookVerifyToken` 默认关闭；公网部署建议打开并配合 IP 白名单 |
 | 鉴权 | `Authorization: Bearer <token>`；事件通道可用 `?access_token=`；token 不会出现在日志与错误信息中 |
 
 **协议端适配**：`get_impl_info` 返回的 `milky_version` 与 `types.APISince` 可用于能力探测（例如 `persist_group_file` 需要 1.3）。
@@ -315,9 +347,8 @@ go test -race ./...
 | **M0** | 单模块骨架；IR 锁定；`internal/jsonx`；`internal/codegen`；`types` 全量生成；契约与行为测试 | ✅ 完成 |
 | **M1** | `Client` / `Config`；`apicall.go`（信封解析、幂等重试、限流、脱敏日志、`Call` 逃生舱）；5 个 service（65 方法）生成；`errors.go`；32 个测试用例 | ✅ 完成 |
 | **M2** | `transport`（WS + ping/pong + 读超时 + 401 降级 query token）、`event`（3 种分发策略 / 背压 / panic 隔离 / 中间件 / 泛型 `On[T]`）、`Start`/`Shutdown`/`WaitReady` 状态机与重连 | ✅ 完成 |
-| **M2** | WebSocket 事件源、连接状态机与自动重连、事件分发（并发 / 全局有序 / 会话有序）、中间件、泛型 `On[T]` | 计划 |
-| **M3** | SSE、WebHook（`http.Handler`）、`segment` DSL、文件上传下载、`mock` 协议端、`examples/` | 计划 |
-| **M4** | 与 Lagrange.Milky 真机 e2e、benchmark、发布 v0.1.0 | 计划 |
+| **M3** | SSE 事件源、WebHook（`http.Handler` + 可选鉴权）、`segment` 构造助手与资源 URI、上传/下载助手、`event` 谓词路由、`mock` 假协议端、4 个 `examples/` | ✅ 完成 |
+| **M4** | 与 Lagrange.Milky 真机 e2e、benchmark、覆盖率与文档收尾、发布 v0.1.0 | 计划 |
 
 详细需求、验收标准与设计取舍见 **[docs/design-requirements.md](docs/design-requirements.md)**（8 组功能需求 FR-1~FR-8、9 条非功能需求、10 条 ADR）。
 

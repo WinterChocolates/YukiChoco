@@ -328,17 +328,16 @@ Milky 是基于 NTQQ 的 QQ 机器人应用接口标准，当前版本 **1.3.0**
 │   ├── dispatcher.go               # 队列、worker、3 种顺序策略、背压、统计
 │   ├── typed.go                    # 泛型 On[T] / Once[T]
 │   ├── middleware.go               # Recover / Timeout / Logging
-│   └── router.go                   # 谓词路由（M3）
+│   └── router.go                   # Router / GroupRouter 谓词路由
 ├── transport/
 │   ├── transport.go                # Source / Session 抽象
 │   ├── ws.go                       # WebSocket 事件源（ping/pong + 读超时）
-│   ├── sse.go                      # SSE 事件源（M3）
-│   └── webhook.go                  # WebHook http.Handler（M3）
-├── segment/                        # 面向使用者的段构造（返回 types 接口）
-│   ├── segment.go
-│   ├── media.go                    # uri 解析、base64、大小限制
-│   └── forward.go
-├── mock/                           # 可编程假协议端（测试用）
+│   ├── sse.go                      # SSE 事件源（多行 data、注释保活）
+│   └── webhook.go                  # WebHook http.Handler（可选 Authorization 校验）
+├── segment/                        # 段构造助手（返回 types 接口）
+│   ├── segment.go                  # Text/Mention/Reply/Image/Forward…
+│   └── media.go                    # URI 归一化、base64、大小限制
+├── mock/                           # 可编程假协议端（API + WS/SSE）
 ├── examples/                       # echo-bot / webhook-bot / sse-client / admin-bot
 └── docs/                           # 设计与文档
 ```
@@ -692,9 +691,24 @@ err := c.Call(ctx, "get_friend_list", map[string]any{}, &out)
 2. `invokeSubscribers` 中一个订阅者 panic 会跳过同事件的其它订阅者 → 改为逐订阅者 recover。
 3. 状态回调最初每个通知起一个 goroutine，导致回调到达顺序与迁移顺序不一致（测试出现 `dialing → disconnected → connected`）→ 改为单一消费 goroutine 串行派发。
 
-### 下一步（M3）
+### M3（已完成）
 
-SSE 与 WebHook（`http.Handler`）事件源、`segment` 包（构造 DSL、`file://`/`base64://` 助手）、文件上传下载、`mock` 可编程假协议端、`examples/`、`event.Router` 谓词路由。
+| 项 | 状态 |
+| --- | --- |
+| `transport/sse.go`：SSE 事件源（`event:`/多行 `data:`/注释保活/`\r\n`），401 降级 query token，读空闲超时靠"读取协程 + Next 侧计时器"实现 | ✅ |
+| `transport/webhook.go`：`Source` + `http.Handler`；`Authorization` 常量时间比较（`WebHookVerifyToken` 默认关）、405/415/429/503 语义、队列满计数 | ✅ |
+| `Client.EventHandler()` / `WebhookDropped()`；`Config` 新增 `EventSourceSSE` / `EventSourceWebhook` / `WebHookVerifyToken` / `WebHookBuffer`；EventURL 按事件源分别推导（ws / http(s) / 空） | ✅ |
+| `segment` 包：`Text`/`Mention`/`MentionAll`/`Face`/`LargeFace`/`Reply`/`Image`/`Sticker`/`Record`/`Video`/`LightApp`/`Forward`/`ForwardWithOptions` | ✅ |
+| `segment.URI`：本地路径 → `file://` 绝对路径；`[]byte`/`io.Reader` → `base64://`；`file://`/`http(s)://`/`base64://` 原样透传；8 MiB 内联上限（`ErrFileTooLarge`，超限不静默截断） | ✅ |
+| 上传/下载助手：`UploadGroupFileFrom/With`、`UploadPrivateFileFrom/With`、`DownloadResource`（临时链接 → 流式 body）、`DownloadFile` | ✅ |
+| `event.Router` / `event.GroupRouter`：`Type` / `Where` / `Group` / `AtMe` / `MentionsAll` / `Prefix` / `Admin` 谓词，谓词不可变（返回新 Router），支持 `Handle` / `HandleEvent` | ✅ |
+| `mock` 包：可编程假协议端（API 注册表 + 调用记录 + WS/SSE 推送 + `?access_token=`/`Authorization` 校验 + `WaitConnected`），未注册端点默认返回空成功 | ✅ |
+| `examples/`：`echo-bot`、`webhook-bot`、`sse-client`、`admin-bot`（含谓词路由与群管理操作） | ✅ |
+| 测试：segment 5 组（构造器 JSON、file/base64/reader、上限、Forward 元信息）、transport SSE 7 个 + WebHook 6 个、router 4 个、mock 端到端 5 个（WS/SSE/WebHook/上传下载/未启用 501） | ✅ |
+
+### 下一步（M4）
+
+与真实 Lagrange.Milky 的 e2e（`MILKY_E2E_BASE_URL` 开关）、benchmark（事件分发 / API 编解码）、覆盖率补齐、文档收尾与 v0.1.0 发布。
 
 ---
 
