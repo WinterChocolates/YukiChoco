@@ -10,7 +10,7 @@ import "github.com/WinterChocolates/YukiChoco"
 - **应用端**：本 SDK（通过 HTTP 调 `/api/{endpoint}`，通过 WebSocket / SSE / WebHook 收事件）
 - **不是**：QQ 协议实现、bot 框架（无插件/权限系统）、OneBot 兼容层
 
-> 当前状态：**v0.1.0 已发布** —— 对齐 Milky 1.3（65 端点 / 21 事件 / 24 消息段），支持 WebSocket / SSE / WebHook 三种事件通道，覆盖率 86.2%（排除生成物与示例），详见 [CHANGELOG](CHANGELOG.md) 与 [基准测试](docs/bench.md)。
+> 当前状态：**v0.1.0 已发布** —— 对齐 Milky 1.3（65 端点 / 21 事件 / 24 消息段），支持 WebSocket / SSE / WebHook 三种事件通道，覆盖率 86.2%（排除生成物与示例），详见 [CHANGELOG](CHANGELOG.md) 与下方[性能](#性能)小节。
 
 ---
 
@@ -29,7 +29,24 @@ import "github.com/WinterChocolates/YukiChoco"
 | 可测试 | `mock` 包提供可编程假协议端（API + WS/SSE 推送），无需真实 QQ 账号即可跑集成测试 |
 | 分发策略 | 并发 / 全局有序 / **按会话有序**（同群有序、跨群并行）；队列满可丢弃或阻塞；panic 隔离；泛型 `YukiChoco.On[T]` 订阅 + 中间件链 |
 | 可校验 | 132 个测试用例/子测试（含 `-race`）、golden 测试锁定生成物、AST 校验方法覆盖度、负例测试阻断协议漂移、覆盖率 86.2%（排除生成物与示例） |
-| 可度量 | 基准测试覆盖分发 / 解码 / API 调用，数据见 [docs/bench.md](docs/bench.md)；CI 校验 gofmt / vet / test / race / 生成物一致性 |
+| 可度量 | 基准测试覆盖分发 / 解码 / API 调用（见[性能](#性能)）；CI 校验 gofmt / vet / test / race / 生成物一致性 |
+
+## 性能
+
+`make bench` 在 32 核 linux/amd64、Go 1.25.9 上采集（`-benchtime=500ms -count=1`），
+只作为回归基线，不是绝对承诺。
+
+| 指标 | 结果 | 说明 |
+| --- | --- | --- |
+| 分发延迟 | 112 ns（顺序）/ 177 ns（按会话 8 分片）/ 232 ns（并发 8 worker） | 投递 + 入队，空 handler |
+| 分发吞吐 | ≈ 8.9M evt/s | 单队列顺序模式 |
+| 解码 + 分发 | 27.8 µs/evt ≈ 35.9k evt/s | 含嵌套 reply 段、群与成员实体 |
+| 事件解码 | 45.5 µs（275 allocs） | 当前最重的一环，优化方向见下 |
+| API 调用（loopback） | 176 µs/次 ≈ 5.6k 次/秒 | 主要由 loopback HTTP 往返决定 |
+| 消息段编解码 | 编码 2.1 µs / 解码 14.4 µs（4 段） | — |
+
+解码开销的三个来源（v0.2 优化项）：`TaggedPeek` 用 map 读取判别字段、信封与 `data`
+两次反序列化、语义化 ID 的自定义 `UnmarshalJSON`。
 
 ---
 
@@ -318,7 +335,7 @@ go test ./...          # 事件解码、段往返、未知内容透传、非法�
                        # ID 宽容解析、omitempty 语义、生成物一致性
 go test -race ./...
 make cover             # 覆盖率（排除 *_gen.go 与 examples/）：当前 86.2%
-make bench             # 基准测试：分发 / 解码 / API 调用，结果见 docs/bench.md
+make bench             # 基准测试：分发 / 解码 / API 调用（见 README「性能」）
 ```
 
 **真机 e2e**（默认跳过，本地/发布前执行）
@@ -363,9 +380,7 @@ MILKY_E2E_GROUP_ID=123456 \        # 可选：提供后会实际发消息并等�
 | **M1** | `Client` / `Config`；`apicall.go`（信封解析、幂等重试、限流、脱敏日志、`Call` 逃生舱）；5 个 service（65 方法）生成；`errors.go`；32 个测试用例 | ✅ 完成 |
 | **M2** | `transport`（WS + ping/pong + 读超时 + 401 降级 query token）、`event`（3 种分发策略 / 背压 / panic 隔离 / 中间件 / 泛型 `On[T]`）、`Start`/`Shutdown`/`WaitReady` 状态机与重连 | ✅ 完成 |
 | **M3** | SSE 事件源、WebHook（`http.Handler` + 可选鉴权）、`segment` 构造助手与资源 URI、上传/下载助手、`event` 谓词路由、`mock` 假协议端、4 个 `examples/` | ✅ 完成 |
-| **M4** | 真机 e2e（环境变量开关）、benchmark（[docs/bench.md](docs/bench.md)）、覆盖率 86.2%、CI（4 平台 × 2 Go 版本 + 生成物校验）、LICENSE、CHANGELOG、v0.1.0 | ✅ 完成 |
-
-详细需求、验收标准与设计取舍见 **[docs/design-requirements.md](docs/design-requirements.md)**（8 组功能需求 FR-1~FR-8、9 条非功能需求、10 条 ADR）。
+| **M4** | 真机 e2e（环境变量开关）、benchmark、覆盖率 86.2%、CI（4 平台 × 2 Go 版本 + 生成物校验）、LICENSE、CHANGELOG、v0.1.0 | ✅ 完成 |
 
 ---
 
