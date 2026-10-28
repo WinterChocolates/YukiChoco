@@ -1,0 +1,6 @@
+.refs/
+nul
+bin/
+dist/
+coverage.out
+*.test
