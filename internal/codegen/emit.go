@@ -22,7 +22,7 @@ func (g *gen) emitAll(dir string) error {
 		{"endpoint_gen.go", nil, g.emitEndpoints},
 	}
 	for _, s := range steps {
-		if err := g.file(dir, s.name, s.imports, s.body); err != nil {
+		if err := g.file(dir, s.name, "types", s.imports, s.body); err != nil {
 			return err
 		}
 	}

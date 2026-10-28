@@ -442,6 +442,8 @@ var (
 
 ### 8.1 最小可用
 
+> 下面的 `Start` / `OnMessageReceive` 属于 M2 的事件层；M1 已可用的 HTTP 部分见 README「调用 API」。
+
 ```go
 package main
 
@@ -606,7 +608,7 @@ err := c.Call(ctx, "get_friend_list", map[string]any{}, &out)
 | 1 | 仓库形态 | **单模块，代码直接在仓库根**（不使用 `milky/` 子目录，不使用 `go.work`） | 模块名 `github.com/WinterChocolates/YukiChoco`，根包名 `YukiChoco`（导入路径与包名一致） |
 | 2 | Go 版本下限 | **1.22** | 可用泛型、`slices`、`log/slog`；CI 矩阵从 1.22 起 |
 | 3 | WebSocket 库 | **`gorilla/websocket`** | 与协议端参考实现一致、生态成熟；`transport/ws.go` 用 `websocket.Dialer`（可注入 `Proxy`/`NetDialContext`），只发 ping 帧、不发应用层心跳 |
-| 4 | API 方法形态 | **service 子对象**：`c.System()/Message()/Friend()/Group()/File()` | 每个 service 生成为 interface + 实现；群聊 service 内省略 `group` 前缀（`Group().SendMessage`），消息 service 保留全名（`Message().SendGroupMessage`） |
+| 4 | API 方法形态 | **service 子对象**：`c.System()/Message()/Friend()/Group()/File()` | 每个 service 生成为 interface + 实现。`send_group_message` 归入 `Group()` 并省略前缀（`Group().SendMessage`，变参消息段），`send_private_message` 在 `Message()`（`Message().SendPrivateMessage`）；其余方法名与 REST 端点一一对应 |
 | 5 | 代码生成 | **自研 `internal/codegen`** | 已实现：IR → `types/*_gen.go`；命名表 `tables.go` 强制登记（新增端点/枚举未登记即生成失败）；golden 测试锁定生成物 |
 | 6 | remilia 适配层 | **暂不做** | SDK 保持框架无关；`types` 可单独引用，未来如需适配不必改 SDK |
 | 7 | E2E 入 CI | **暂不做** | e2e 保留为本地/发布前 checklist（`MILKY_E2E_BASE_URL` 开启），CI 只跑单元/契约/race |
@@ -644,9 +646,24 @@ err := c.Call(ctx, "get_friend_list", map[string]any{}, &out)
 - 事件：`Event` 接口 + `UnmarshalEvent`；每事件形如 `MessageReceiveEvent{EventMeta; Data IncomingMessage}`；未知事件 `UnknownEvent{Raw}` 原样回填。
 - 请求模型：可选字段指针 + `omitempty`，带默认值字段值类型 + `omitempty`（`parent_folder_id`、`limit`、`duration`、`is_mute` 等零值不发送）。
 
-### 下一步（M1）
+### M1（已完成）
 
-`Client` 骨架 + `apicall.go`（信封解析 / 重试 / 限流 / 脱敏日志）+ 5 个 service 的生成（基于 `types.EndpointService` 映射表）+ `errors.go`。
+| 项 | 状态 |
+| --- | --- |
+| `config.go`：`Config` / `RetryConfig` / `RateLimitConfig`，默认值填充、BaseURL 校验与尾斜杠规范化、`String()`/`LogValue()` 脱敏 | ✅ |
+| `errors.go`：9 个哨兵错误 + `APIError{Endpoint,Retcode,Message,Snippet}`，按 retcode `-400/-403/-404` 归类，`errors.Is/As` 可用 | ✅ |
+| `apicall.go`：统一信封解析、HTTP 401/404/415/5xx 映射、`{}` 空请求体、超时分层、指数退避 + 抖动、`Call` / `CallRaw` 逃生舱 | ✅ |
+| 幂等重试：仅 `get_/set_/mark_/delete_/move_/rename_/accept_/reject_/quit_/persist_` 前缀重试；`send_*` 默认不重试（可用 `RetryNonIdempotent` 显式开启） | ✅ |
+| 限流：零依赖令牌桶（惰性补充、无后台 goroutine），`RateLimit.QPS<=0` 即关闭 | ✅ |
+| 脱敏：日志、错误信息、`Config.String()`、`DebugDump` 均不出现 access_token（测试断言 `***` 出现、原值不出现） | ✅ |
+| `client.go`：`New` / `Init`（缓存 `SelfID` 与 `ProtocolInfo` 并校验协议版本）/ `Close`（幂等、`ErrClosed`）/ 5 个 service 访问器 | ✅ |
+| service 生成：5 个 interface + 实现共 65 个方法，`send_group_message` → `Group().SendMessage(ctx, groupID, segments...)`（变参）、`send_private_message` → `Message().SendPrivateMessage(...)` | ✅ |
+| `api_ext.go`：`SendGroupText` / `SendPrivateText` / `ReplyGroup` / `ReplyPrivate` / `SendGroupSegments` / `SendPrivateSegments` | ✅ |
+| 测试：32 个用例（请求形状、信封/retcode、HTTP 状态、幂等重试边界、ctx 取消、限流、脱敏、`Init` 缓存、关闭幂等、配置校验、退避边界）+ AST 方法覆盖度对齐 IR | ✅ |
+
+### 下一步（M2）
+
+WebSocket 事件源（`gorilla/websocket`，ping/pong + 读超时，不发应用层心跳）、连接状态机与自动重连、事件分发（并发 / 全局有序 / 会话有序）、泛型 `On[T]` 订阅、中间件链、`Start`/`Shutdown` 生命周期。
 
 ---
 

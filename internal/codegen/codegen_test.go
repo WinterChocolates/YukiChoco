@@ -10,7 +10,7 @@ import (
 
 const specPath = "../../protocol/protocol-1.3.0.json"
 
-// generatedFiles 是 codegen 的产物清单，新增生成文件时必须同步此列表。
+// generatedFiles 是 types 包的产物清单，新增生成文件时必须同步此列表。
 var generatedFiles = []string{
 	"enum_gen.go",
 	"entity_gen.go",
@@ -18,6 +18,15 @@ var generatedFiles = []string{
 	"event_gen.go",
 	"api_model_gen.go",
 	"endpoint_gen.go",
+}
+
+// generatedServiceFiles 是根包 service 的产物清单。
+var generatedServiceFiles = []string{
+	"service_system_gen.go",
+	"service_message_gen.go",
+	"service_friend_gen.go",
+	"service_group_gen.go",
+	"service_file_gen.go",
 }
 
 // TestGolden 保证 types/ 下的生成物与 IR 完全一致：
@@ -35,18 +44,28 @@ func TestGolden(t *testing.T) {
 	if err := g.emitAll(dir); err != nil {
 		t.Fatalf("emitAll: %v", err)
 	}
-	for _, name := range generatedFiles {
+	if err := g.emitServices(dir, defaultPkg, defaultModule); err != nil {
+		t.Fatalf("emitServices: %v", err)
+	}
+
+	compare := func(name, repoPath string) {
 		got, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			t.Fatalf("读取生成物 %s: %v", name, err)
 		}
-		want, err := os.ReadFile(filepath.Join("../../types", name))
+		want, err := os.ReadFile(repoPath)
 		if err != nil {
-			t.Fatalf("读取仓库中的 %s: %v", name, err)
+			t.Fatalf("读取仓库中的 %s: %v", repoPath, err)
 		}
 		if !bytes.Equal(got, want) {
-			t.Errorf("types/%s 与 IR 生成结果不一致；请执行 `make generate`", name)
+			t.Errorf("%s 与 IR 生成结果不一致；请执行 `make generate`", repoPath)
 		}
+	}
+	for _, name := range generatedFiles {
+		compare(name, filepath.Join("../../types", name))
+	}
+	for _, name := range generatedServiceFiles {
+		compare(name, filepath.Join("../../", name))
 	}
 }
 

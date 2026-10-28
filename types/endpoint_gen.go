@@ -271,7 +271,7 @@ var EndpointService = map[string]struct{ Service, Method string }{
 	"rename_group_folder":            {"File", "RenameGroupFolder"},
 	"send_friend_nudge":              {"Friend", "SendFriendNudge"},
 	"send_group_announcement":        {"Group", "SendAnnouncement"},
-	"send_group_message":             {"Message", "SendGroupMessage"},
+	"send_group_message":             {"Group", "SendMessage"},
 	"send_group_message_reaction":    {"Group", "SendMessageReaction"},
 	"send_group_nudge":               {"Group", "SendNudge"},
 	"send_private_message":           {"Message", "SendPrivateMessage"},

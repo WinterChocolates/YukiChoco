@@ -10,7 +10,7 @@ import "github.com/WinterChocolates/YukiChoco"
 - **应用端**：本 SDK（通过 HTTP 调 `/api/{endpoint}`，通过 WebSocket / SSE / WebHook 收事件）
 - **不是**：QQ 协议实现、bot 框架（无插件/权限系统）、OneBot 兼容层
 
-> 当前状态：**M0 已完成**（协议数据模型 + 代码生成 + 契约测试），`Client` 与 API 调用层在 M1 落地。见 [Roadmap](#roadmap)。
+> 当前状态：**M0–M1 已完成** —— 协议数据模型（IR 生成）、HTTP API 调用层（65 个强类型方法 + `Call` 逃生舱）、幂等重试、限流、脱敏日志与契约测试。事件订阅（WS/SSE/WebHook）在 M2。见 [Roadmap](#roadmap)。
 
 ---
 
@@ -23,7 +23,8 @@ import "github.com/WinterChocolates/YukiChoco"
 | 宽容解码 | 未知事件、未知消息段、未知枚举值**原样透传**，不因协议端升级而崩；数组中的非法元素被跳过 |
 | 语义化 ID | `UserID` / `GroupID` / `Uin` / `MessageSeq` 各自独立类型，编译期阻断群号与 QQ 号串用 |
 | 零第三方依赖 | 当前仅标准库；WebSocket 在 M2 引入 `gorilla/websocket` |
-| 可校验 | golden 测试锁定生成物、负例测试阻断协议漂移、`-race` 全绿 |
+| API 调用层 | 65 个强类型方法挂在 5 个 service 上（`c.Group().SendMessage(...)`），`context` 全链路，统一信封解析与 `retcode` 归类 |
+| 可校验 | golden 测试锁定生成物、AST 校验方法覆盖度、负例测试阻断协议漂移、`-race` 全绿 |
 
 ---
 
@@ -100,11 +101,12 @@ raw, err := json.Marshal(segs)
 
 `uri` 支持 `file://`、`http(s)://`、`base64://` 三种形式（M3 会提供 `segment.ImageFromFile` 等助手）。
 
-### 3. 目标用法（M1 落地后可用）
+### 3. 调用 API（M1 起可用）
 
 ```go
 import (
 	"context"
+	"fmt"
 
 	"github.com/WinterChocolates/YukiChoco"
 	"github.com/WinterChocolates/YukiChoco/types"
@@ -112,12 +114,73 @@ import (
 
 c, err := YukiChoco.New(YukiChoco.Config{
 	BaseURL:     "http://127.0.0.1:6700",
-	AccessToken: "your-token",
-	EventSource: YukiChoco.EventSourceWS,
+	AccessToken: "your-token", // 也可用 YukiChoco.Config{}.AccessToken 留空表示不鉴权
 })
 if err != nil {
 	panic(err)
 }
+defer c.Close()
+
+ctx := context.Background()
+
+// 拉取协议端与登录信息（此后 SelfID / ProtocolInfo 可用）
+if err := c.Init(ctx); err != nil {
+	panic(err)
+}
+fmt.Println("登录为", c.SelfID())
+
+// 发送群消息：service 子对象 + 变参消息段
+res, err := c.Group().SendMessage(ctx, types.GroupID(987654321),
+	&types.OutgoingReplySegment{MessageSeq: 23333},
+	&types.OutgoingTextSegment{Text: "你好"},
+)
+if err != nil {
+	panic(err)
+}
+fmt.Println("消息序列号", res.MessageSeq)
+
+// 其余端点使用请求结构体（service 划分与 Milky IR 的分类一致）
+friends, err := c.System().GetFriendList(ctx, &types.GetFriendListRequest{NoCache: true})
+group, err := c.System().GetGroupInfo(ctx, &types.GetGroupInfoRequest{GroupID: 987654321})
+members, err := c.System().GetGroupMemberList(ctx, &types.GetGroupMemberListRequest{GroupID: 987654321})
+_, _, _, _ = friends, group, members, err
+
+// 未建模的端点走逃生舱
+var raw struct {
+	Cookies []string `json:"cookies"`
+}
+err = c.Call(ctx, "get_cookies", map[string]any{"domain": "qun.qq.com"}, &raw)
+```
+
+API 方法挂在 **service 子对象**上：`c.System()` / `c.Message()` / `c.Friend()` / `c.Group()` / `c.File()`。
+群相关操作聚合在 `Group()`（因此是 `c.Group().SendMessage(...)` 而不是 `SendGroupMessage`），私聊发送在 `c.Message().SendPrivateMessage(...)`。
+常用组合还有手写便捷方法：`c.SendGroupText`、`c.ReplyGroup`、`c.SendGroupSegments`。
+
+**错误处理**用哨兵错误判别，而不是文案：
+
+```go
+if _, err := c.Group().Quit(ctx, &types.QuitGroupRequest{GroupID: 1}); err != nil {
+	switch {
+	case errors.Is(err, YukiChoco.ErrNotLoggedIn):   // retcode -403
+	case errors.Is(err, YukiChoco.ErrBadRequest):    // retcode -400
+	case errors.Is(err, YukiChoco.ErrNotFound):      // retcode -404
+	case errors.Is(err, YukiChoco.ErrUnauthorized):  // HTTP 401
+	}
+	var apiErr *YukiChoco.APIError
+	if errors.As(err, &apiErr) {
+		fmt.Println(apiErr.Endpoint, apiErr.Retcode)
+	}
+}
+```
+
+### 4. 事件订阅（M2 落地后可用）
+
+```go
+c, _ := YukiChoco.New(YukiChoco.Config{
+	BaseURL:     "http://127.0.0.1:6700",
+	AccessToken: "your-token",
+	EventSource: YukiChoco.EventSourceWS, // webhook / sse / none
+})
 
 self := c.SelfID()
 c.OnMessageReceive(func(ctx context.Context, ev *types.MessageReceiveEvent) error {
@@ -138,14 +201,12 @@ if err := c.Start(context.Background()); err != nil {
 defer c.Shutdown(context.Background())
 ```
 
-API 方法挂在 **service 子对象**上：`c.System()` / `c.Message()` / `c.Friend()` / `c.Group()` / `c.File()`，例如 `c.Group().SendMessage(...)`、`c.System().GetLoginInfo(ctx)`、`c.File().UploadGroupFile(...)`。未建模的端点可用 `c.Call(ctx, "endpoint", in, out)`。
-
 ---
 
 ## 包结构
 
 ```
-github.com/WinterChocolates/YukiChoco     package YukiChoco  ← Client / Config / 事件分发（M1-M3）
+github.com/WinterChocolates/YukiChoco     package YukiChoco  ← Client / Config / 5 个 service / 事件分发（M2）
 ├── types                                 协议数据模型：实体 / 事件 / 消息段 / API 模型（已可用）
 ├── event                                 事件分发、泛型 On[T]、中间件、路由（M2）
 ├── segment                               消息段构造 DSL、媒体 uri 助手（M3）
@@ -209,8 +270,8 @@ go test -race ./...
 
 | 里程碑 | 内容 | 状态 |
 | --- | --- | --- |
-| **M0** | 多模块骨架 → 单模块；IR 锁定；`internal/jsonx`；`internal/codegen`；`types` 全量生成；契约与行为测试 | ✅ 完成 |
-| **M1** | `Client` / `Config`；`apicall.go`（信封解析、幂等重试、限流、脱敏日志、`Call` 逃生舱）；5 个 service 生成；`errors.go` | 进行中 |
+| **M0** | 单模块骨架；IR 锁定；`internal/jsonx`；`internal/codegen`；`types` 全量生成；契约与行为测试 | ✅ 完成 |
+| **M1** | `Client` / `Config`；`apicall.go`（信封解析、幂等重试、限流、脱敏日志、`Call` 逃生舱）；5 个 service（65 方法）生成；`errors.go`；32 个测试用例 | ✅ 完成 |
 | **M2** | WebSocket 事件源、连接状态机与自动重连、事件分发（并发 / 全局有序 / 会话有序）、中间件、泛型 `On[T]` | 计划 |
 | **M3** | SSE、WebHook（`http.Handler`）、`segment` DSL、文件上传下载、`mock` 协议端、`examples/` | 计划 |
 | **M4** | 与 Lagrange.Milky 真机 e2e、benchmark、发布 v0.1.0 | 计划 |

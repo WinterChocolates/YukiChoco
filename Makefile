@@ -1,7 +1,7 @@
 # YukiChoco Milky SDK — 构建入口
 #
 #   make generate   由 protocol/protocol-1.3.0.json 重新生成 types 包
-#   make check      生成物 diff / vet / test / race 全量校验
+#   make check      生成 / vet / test / race 全量校验（含生成物一致性）
 #   make spec-check 拉取上游最新 Milky IR 并与本地锁定版本对比
 
 GO ?= go
@@ -13,7 +13,7 @@ SPEC_URL ?= https://unpkg.com/@saltify/milky-protocol@$(SPEC_VERSION)/dist/proto
 all: check
 
 generate:
-	$(GO) run ./internal/codegen -spec protocol/protocol-$(SPEC_VERSION).json -out types
+	$(GO) run ./internal/codegen -spec protocol/protocol-$(SPEC_VERSION).json -out types -services .
 
 fmt:
 	$(GO) fmt ./...
@@ -27,13 +27,9 @@ test:
 race:
 	$(GO) test -race ./...
 
-# 生成物必须与 IR 一致，且不允许手改
+# 生成物必须与 IR 一致且不允许手改：由 internal/codegen 的 TestGolden 兜底
+# （它把 IR 重新生成到临时目录后与仓库文件逐字节比对，不依赖 git 状态）。
 check: generate fmt vet test race
-	@if git rev-parse --git-dir >/dev/null 2>&1; then \
-		git diff --exit-code -- types || (echo "types/ 与 IR 不一致：生成物被手改或未重新生成" && exit 1); \
-	else \
-		echo "跳过生成物 diff（当前目录不是 git 仓库）"; \
-	fi
 
 spec-fetch:
 	curl -fsSL -o /tmp/milky-protocol-latest.json $(SPEC_URL)

@@ -116,8 +116,10 @@ var endpoints = map[string]endpointSpec{
 	"get_csrf_token":           {"System", "GetCSRFToken"},
 
 	// 消息 API
-	"send_private_message":   {"Message", "SendPrivateMessage"},
-	"send_group_message":     {"Message", "SendGroupMessage"},
+	"send_private_message": {"Message", "SendPrivateMessage"},
+	// 群消息发送归入 Group service（方法名省掉 group 前缀），
+	// 这样调用处读作 c.Group().SendMessage(...)，与其余群操作聚合在一起。
+	"send_group_message":     {"Group", "SendMessage"},
 	"recall_private_message": {"Message", "RecallPrivateMessage"},
 	"recall_group_message":   {"Message", "RecallGroupMessage"},
 	"get_message":            {"Message", "GetMessage"},
@@ -188,7 +190,25 @@ func (g *gen) validate() error {
 		}
 	}
 
-	// 2. 同一 service 内方法名不得重复。
+	// 2. service 必须登记在 serviceOrder 中，且每个 service 至少有一个端点。
+	knownService := map[string]bool{}
+	for _, s := range serviceOrder {
+		knownService[s] = true
+	}
+	perService := map[string]int{}
+	for ep, spec := range endpoints {
+		if !knownService[spec.Service] {
+			return fmt.Errorf("端点 %q 的 service %q 未在 serviceOrder 中登记", ep, spec.Service)
+		}
+		perService[spec.Service]++
+	}
+	for _, s := range serviceOrder {
+		if perService[s] == 0 {
+			return fmt.Errorf("service %q 没有任何端点", s)
+		}
+	}
+
+	// 3. 同一 service 内方法名不得重复。
 	seenMethod := map[string]bool{}
 	for ep, spec := range endpoints {
 		key := spec.Service + "." + spec.Method
@@ -198,7 +218,7 @@ func (g *gen) validate() error {
 		seenMethod[key] = true
 	}
 
-	// 3. 枚举字段必须有命名，且值域与 IR 一致。
+	// 4. 枚举字段必须有命名，且值域与 IR 一致。
 	checkField := func(where string, f Field) error {
 		if f.FieldType != "enum" {
 			return nil
@@ -258,7 +278,7 @@ func (g *gen) validate() error {
 		}
 	}
 
-	// 4. 生成名去重（不同联合类型的同名分支会撞车）。
+	// 5. 生成名去重（不同联合类型的同名分支会撞车）。
 	names := map[string]string{}
 	claim := func(name, owner string) error {
 		if prev, ok := names[name]; ok {
