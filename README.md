@@ -394,83 +394,6 @@ if _, err := c.Group().SetMemberMute(ctx, req); err != nil {
 
 ---
 
-## 测试
-
-### 用假协议端写测试（无需真实 QQ）
-
-```go
-func TestMyBot(t *testing.T) {
-	srv := mock.New(mock.WithToken("tok"))
-	defer srv.Close()
-	srv.Handle("get_login_info", func(json.RawMessage) (any, error) {
-		return map[string]any{"uin": 100, "nickname": "bot"}, nil
-	})
-	srv.Handle("send_group_message", func(json.RawMessage) (any, error) {
-		return map[string]any{"message_seq": 1, "time": 2}, nil
-	})
-
-	ctx := context.Background()
-	c, _ := YukiChoco.New(YukiChoco.Config{BaseURL: srv.URL(), AccessToken: "tok"})
-	c.Start(ctx)
-	srv.WaitConnected(ctx, 1)
-	srv.PushJSON([]byte(`{"time":1,"self_id":100,"event_type":"message_receive","data":{...}}`))
-
-	// 断言你的 bot 发出的请求
-	call, _ := srv.LastCall("send_group_message")
-	_ = call.Body
-}
-```
-
-`mock` 支持：`Handle`（端点注册）、`OnAnyAPI`（兜底）、`Calls`/`LastCall`（调用记录）、
-`Push`/`PushJSON`（WS 或 SSE 推送）、`WithSSE`、`WaitConnected`；未注册端点默认返回空成功。
-
-### 真机 e2e（默认跳过）
-
-```bash
-MILKY_E2E_BASE_URL=http://127.0.0.1:6700 \
-MILKY_E2E_TOKEN=your-token \
-MILKY_E2E_GROUP_ID=123456 \        # 可选；提供后会实际发消息、等事件回显、再撤回
-  go test -run TestE2E -v ./
-```
-
----
-
-## 性能
-
-`make bench`（32 核 linux/amd64、Go 1.25.9、`-benchtime=500ms`）。仅作回归基线：
-
-| 指标 | 结果 | 说明 |
-| --- | --- | --- |
-| 分发延迟 | 112 ns / 177 ns / 232 ns | 顺序 / 按会话 8 分片 / 并发 8 worker（空 handler） |
-| 分发吞吐 | ≈ 8.9M evt/s | 单队列顺序模式 |
-| 解码 + 分发 | 27.8 µs/evt ≈ 35.9k evt/s | 含嵌套 reply 段、群与成员实体 |
-| 事件解码 | 45.5 µs（275 allocs） | 当前最重的一环 |
-| API 调用（loopback） | 176 µs/次 ≈ 5.6k 次/秒 | 主要由 loopback HTTP 往返决定 |
-| 段编解码 | 编码 2.1 µs / 解码 14.4 µs（4 段） | — |
-
-解码开销的三个来源（后续优化项）：`TaggedPeek` 用 map 读取判别字段、信封与 `data`
-两次反序列化、语义化 ID 的自定义 `UnmarshalJSON`。
-
----
-
-## 兼容性与注意事项
-
-以下都是从 Milky 规范推导出的**硬约束**，也是与其它实现的行为差异点：
-
-| 事项 | 行为 |
-| --- | --- |
-| 事件丢失 | Milky 无 ack、无序号重放：事件通道断开期间的事件会丢失，SDK **不承诺**重连补发；严格不丢请用 `BackpressureBlock` 并配合 `get_history_messages` 对账 |
-| 发送不重试 | 无幂等键，`send_*` 重试会造成重复消息；仅幂等端点自动重试 |
-| 可选字段 | 指针 + `omitempty`；带默认值字段用值类型 + `omitempty`，让协议端应用默认值（如 `parent_folder_id="/"`、`limit=20`） |
-| ID 精度 | 一律 `int64` 语义化类型；解码接受数字或数字字符串，拒绝浮点；编码始终输出 JSON 数字 |
-| 未知内容 | `UnknownEvent` / `UnknownIncomingSegment` / `UnknownIncomingMessage` / `UnknownGroupNotification` 保留原始 JSON，序列化原样回填 |
-| 数组容错 | 消息段列表逐元素解码，坏元素上报后跳过，不影响整条消息 |
-| 心跳 | 不使用应用层心跳帧（Milky 协议里没有），靠 WebSocket ping/pong + 读空闲超时 |
-| WebHook 鉴权 | 协议端不保证发送 `Authorization`，`WebHookVerifyToken` 默认关闭；公网部署建议打开并配合 IP 白名单 |
-| 协议版本 | 启动后 `get_impl_info` 返回的 `milky_version` 与 SDK 基线不一致时会打 WARN；`types.APISince` 可用于能力探测 |
-
----
-
 ## 包结构
 
 ```
@@ -532,18 +455,6 @@ MILKY_BASE_URL=http://127.0.0.1:6700 MILKY_TOKEN=xxx go run ./examples/admin-bot
 | `sse-client` | `EventSourceSSE`、中间件、状态回调、运行统计 |
 | `admin-bot` | 谓词路由（`AtMe().Admin().Prefix()`）、禁言 / 撤回 / 公告 / 上传群文件 |
 
----
-
-## Roadmap
-
-| 里程碑 | 内容 | 状态 |
-| --- | --- | --- |
-| **M0** | IR 锁定、`internal/jsonx`、代码生成、`types` 全量生成与契约测试 | ✅ |
-| **M1** | `Client`/`Config`、信封解析、幂等重试、限流、脱敏日志、5 个 service（65 方法）、错误模型 | ✅ |
-| **M2** | WebSocket 事件源、状态机与重连、分发器（3 种策略 + 背压 + panic 隔离）、中间件、泛型订阅 | ✅ |
-| **M3** | SSE、WebHook、`segment` 构造、上传下载、谓词路由、`mock`、4 个示例 | ✅ |
-| **M4** | 真机 e2e、benchmark、覆盖率、CI、LICENSE/CHANGELOG、**v0.1.0** | ✅ |
-| **v0.2（计划）** | 解码性能专项、`get_history_messages` 分页/去重助手、golangci-lint 接入 | ⏳ |
 
 ---
 
