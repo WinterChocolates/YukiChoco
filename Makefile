@@ -8,7 +8,7 @@ GO ?= go
 SPEC_VERSION ?= 1.3.0
 SPEC_URL ?= https://unpkg.com/@saltify/milky-protocol@$(SPEC_VERSION)/dist/protocol.json
 
-.PHONY: all generate fmt vet test race check spec-fetch spec-check clean
+.PHONY: all generate fmt vet test race check cover bench spec-fetch spec-check clean
 
 all: check
 
@@ -31,6 +31,17 @@ race:
 # （它把 IR 重新生成到临时目录后与仓库文件逐字节比对，不依赖 git 状态）。
 check: generate fmt vet test race
 
+# 覆盖率：排除 *_gen.go（协议生成物）与 examples/（示例程序），给出总行覆盖率
+cover:
+	$(GO) test ./... -coverprofile=coverage.out -covermode=atomic -coverpkg=./...
+	@grep -v -e '_gen\.go' -e '/examples/' coverage.out > coverage.filtered.out
+	@$(GO) tool cover -func=coverage.filtered.out | tail -1
+	@rm -f coverage.out coverage.filtered.out
+
+# 基准测试（事件分发 / 解码 / API 调用）
+bench:
+	$(GO) test -run '^$$' -bench . -benchmem -benchtime=500ms ./ ./event ./types
+
 spec-fetch:
 	curl -fsSL -o /tmp/milky-protocol-latest.json $(SPEC_URL)
 	@echo "上游 IR 已下载到 /tmp/milky-protocol-latest.json"
@@ -40,3 +51,4 @@ spec-check: spec-fetch
 
 clean:
 	$(GO) clean ./...
+	@rm -f coverage.out coverage.filtered.out

@@ -187,3 +187,18 @@ func TestMediaHelpers(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestImageFromReaderAndURL(t *testing.T) {
+	seg, err := segment.ImageFromReader(bytes.NewReader([]byte("img")))
+	if err != nil {
+		t.Fatalf("ImageFromReader: %v", err)
+	}
+	if !strings.Contains(mustJSON(t, seg), "base64://") {
+		t.Fatalf("ImageFromReader 应使用 base64: %s", mustJSON(t, seg))
+	}
+
+	seg = segment.ImageFromURL("https://example.com/a.png")
+	if !strings.Contains(mustJSON(t, seg), `"uri":"https://example.com/a.png"`) {
+		t.Fatalf("ImageFromURL = %s", mustJSON(t, seg))
+	}
+}

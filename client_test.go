@@ -507,3 +507,63 @@ func itoa(v int) string {
 	}
 	return string(buf[i:])
 }
+
+func TestAPIErrorHelpers(t *testing.T) {
+	err := &APIError{Endpoint: "send_group_message", Retcode: RetcodeNotLoggedIn, Message: "未登录"}
+	if err.IsRetryable() {
+		t.Error("协议层错误不应重试")
+	}
+	if !errors.Is(err, ErrNotLoggedIn) {
+		t.Error("errors.Is(ErrNotLoggedIn) = false")
+	}
+	if !strings.Contains(err.Error(), "send_group_message") || !strings.Contains(err.Error(), "-403") {
+		t.Errorf("Error() = %s", err.Error())
+	}
+
+	// retcode 为 0 但 status=failed 的畸形响应归入 ErrProtocolFailure。
+	weird := &APIError{Endpoint: "x", Retcode: 0, Message: ""}
+	if !errors.Is(weird, ErrProtocolFailure) {
+		t.Error("retcode=0 的失败应归入 ErrProtocolFailure")
+	}
+	if !strings.Contains(weird.Error(), "协议端未提供错误信息") {
+		t.Errorf("Error() = %s", weird.Error())
+	}
+	// 未定义 retcode 不匹配任何哨兵。
+	if errors.Is(&APIError{Retcode: -999}, ErrBadRequest) {
+		t.Error("未知 retcode 不应匹配哨兵")
+	}
+}
+
+func TestStateString(t *testing.T) {
+	cases := map[State]string{
+		StateDisconnected: "disconnected",
+		StateDialing:      "dialing",
+		StateConnected:    "connected",
+		StateReconnecting: "reconnecting",
+		StateClosed:       "closed",
+		State(99):         "unknown",
+	}
+	for st, want := range cases {
+		if got := st.String(); got != want {
+			t.Errorf("State(%d).String() = %q, want %q", st, got, want)
+		}
+	}
+}
+
+func TestReconnectDelayBackoff(t *testing.T) {
+	c := &Client{cfg: Config{Reconnect: ReconnectConfig{
+		InitialDelay: 100 * time.Millisecond,
+		MaxDelay:     400 * time.Millisecond,
+		Multiplier:   2,
+		Jitter:       -1, // 关闭抖动，便于断言
+	}}}
+	if got := c.reconnectDelay(1); got != 100*time.Millisecond {
+		t.Errorf("attempt 1 = %s", got)
+	}
+	if got := c.reconnectDelay(2); got != 200*time.Millisecond {
+		t.Errorf("attempt 2 = %s", got)
+	}
+	if got := c.reconnectDelay(10); got != 400*time.Millisecond {
+		t.Errorf("退避应封顶在 MaxDelay，got %s", got)
+	}
+}

@@ -32,9 +32,16 @@ func Report(err error, context string) {
 //
 // payload 必须序列化为 JSON 对象；无字段的消息段（如 mention_all）传空结构体即可。
 func MarshalTagged(tag string, payload any) ([]byte, error) {
+	if payload == nil {
+		payload = struct{}{}
+	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("jsonx: 序列化 %q 的消息段数据失败: %w", tag, err)
+	}
+	// 无字段的消息段（如 mention_all）可能以 nil 指针传入。
+	if string(data) == "null" {
+		data = []byte("{}")
 	}
 	if len(data) == 0 || data[0] != '{' {
 		return nil, fmt.Errorf("jsonx: %q 的消息段数据必须是 JSON 对象，实际为 %s", tag, data)

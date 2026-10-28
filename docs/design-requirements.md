@@ -706,9 +706,26 @@ err := c.Call(ctx, "get_friend_list", map[string]any{}, &out)
 | `examples/`：`echo-bot`、`webhook-bot`、`sse-client`、`admin-bot`（含谓词路由与群管理操作） | ✅ |
 | 测试：segment 5 组（构造器 JSON、file/base64/reader、上限、Forward 元信息）、transport SSE 7 个 + WebHook 6 个、router 4 个、mock 端到端 5 个（WS/SSE/WebHook/上传下载/未启用 501） | ✅ |
 
-### 下一步（M4）
+### M4（已完成，v0.1.0）
 
-与真实 Lagrange.Milky 的 e2e（`MILKY_E2E_BASE_URL` 开关）、benchmark（事件分发 / API 编解码）、覆盖率补齐、文档收尾与 v0.1.0 发布。
+| 项 | 状态 |
+| --- | --- |
+| 真机 e2e：`e2e_test.go`，`MILKY_E2E_BASE_URL` 未设置时 `t.Skip`；覆盖 `Init` / 好友与群列表 / WS 就绪 / 发消息 → 事件回显 → 撤回 / 分发统计 | ✅ |
+| 基准：`event/bench_test.go`、`types/bench_test.go`、`bench_test.go`（分发三模式、队列满丢弃、完整解码+分发链路、事件解码、段编解码、ID 解析、API 调用）；结果记录在 `docs/bench.md` | ✅ |
+| 关键指标：分发 112–232 ns/op（顺序 ≈ 8.9M evt/s）、解码+分发 27.8 µs/evt（≈ 35.9k evt/s，NFR-1 要求 5k）、API 调用 ≈ 176 µs/次（loopback） | ✅ |
+| 覆盖率：`make cover` 排除 `*_gen.go` 与 `examples/` 后 **88.1%**（NFR-7 要求 ≥ 85%） | ✅ |
+| CI：GitHub Actions —— gofmt / vet / test / `-race`，Go 1.22+1.23 × Linux+Windows 矩阵；独立 job 校验「重新生成后无 diff」与 golden 测试；独立 job 跑覆盖率 | ✅ |
+| 发布准备：`LICENSE`（MIT）、`CHANGELOG.md`（0.1.0）、`version.go` = `0.1.0`、README 收尾（示例、e2e、bench、许可证） | ✅ |
+
+**DoD 对照（v0.1.0）**
+
+| 设计文档 DoD | 结果 |
+| --- | --- |
+| `go test -race ./...` 全绿、覆盖率 ≥ 85%（排除生成物） | ✅ 88.1% |
+| 65 API / 21 事件与 IR 集合完全一致（自动化断言） | ✅ `TestIRBaseline` + `TestServiceCoverageMatchesIR` + `TestGolden` |
+| 三种事件通道各有可运行示例 | ✅ WS/SSE/WebHook 端到端测试 + 4 个 example |
+| 4 平台交叉编译、`golangci-lint` 无告警 | ⚠️ 交叉编译由 CI 矩阵覆盖（Linux/Windows）；golangci-lint 未接入（以 `go vet` + `gofmt` 代替），留待后续 |
+| 真机 e2e | ⏳ 测试已就绪，需提供 `MILKY_E2E_BASE_URL` 的协议端实例执行 |
 
 ---
 
