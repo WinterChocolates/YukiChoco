@@ -221,6 +221,20 @@ func (g *gen) goType(f Field) (string, error) {
 	return base, nil
 }
 
+// unionFields 返回字段中引用联合类型（接口）的项。
+//
+// 这些字段无法直接交给 encoding/json 填充（接口没有具体类型），
+// 需要在包含它们的结构体上生成自定义 UnmarshalJSON。
+func (g *gen) unionFields(fields []Field) []Field {
+	var out []Field
+	for _, f := range fields {
+		if f.FieldType == "ref" && g.isUnionRef(f.RefStructName) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // fieldSpec 是生成结构体字段所需的全部信息。
 type fieldSpec struct {
 	name  string

@@ -310,3 +310,61 @@ func TestProtocolMetadata(t *testing.T) {
 		}
 	}
 }
+
+// TestDecodeResponsesWithUnionFields 回归测试：响应结构体里的联合类型字段
+// （IncomingMessage / GroupNotification 是接口）必须能通过自定义 UnmarshalJSON 解码。
+func TestDecodeResponsesWithUnionFields(t *testing.T) {
+	groupMsg := `{"message_scene":"group","peer_id":200,"message_seq":7,"sender_id":300,"time":1,
+		"segments":[{"type":"text","data":{"text":"hi"}}],
+		"group":{"group_id":200,"group_name":"g","member_count":1,"max_member_count":1},
+		"group_member":{"user_id":300,"nickname":"n","sex":"unknown","group_id":200,
+			"card":"","title":"","level":1,"role":"member","join_time":1,"last_sent_time":1}}`
+	friendMsg := `{"message_scene":"friend","peer_id":400,"message_seq":9,"sender_id":400,"time":2,
+		"segments":[],"friend":{"user_id":400,"nickname":"f","sex":"unknown","qid":"","remark":"",
+			"category":{"category_id":0,"category_name":""}}}`
+
+	var one types.GetMessageResponse
+	if err := json.Unmarshal([]byte(`{"message":`+groupMsg+`}`), &one); err != nil {
+		t.Fatalf("GetMessageResponse: %v", err)
+	}
+	msg, ok := one.Message.(*types.GroupMessage)
+	if !ok || msg.MessageSeq != 7 {
+		t.Fatalf("Message = %#v", one.Message)
+	}
+
+	var history types.GetHistoryMessagesResponse
+	if err := json.Unmarshal([]byte(`{"messages":[`+groupMsg+`,`+friendMsg+`],"next_message_seq":3}`), &history); err != nil {
+		t.Fatalf("GetHistoryMessagesResponse: %v", err)
+	}
+	if len(history.Messages) != 2 {
+		t.Fatalf("历史消息数量 = %d", len(history.Messages))
+	}
+	if history.Messages[0].Scene() != types.MessageSceneGroup || history.Messages[1].Scene() != types.MessageSceneFriend {
+		t.Fatalf("场景顺序错误: %v %v", history.Messages[0].Scene(), history.Messages[1].Scene())
+	}
+	if history.NextMessageSeq == nil || *history.NextMessageSeq != 3 {
+		t.Errorf("NextMessageSeq = %v", history.NextMessageSeq)
+	}
+
+	// 数组中的非法元素应被跳过而不是让整个响应失败（兼容性契约 C3）。
+	var skipped types.GetHistoryMessagesResponse
+	raw := `{"messages":[` + groupMsg + `,{"message_scene":123}]}`
+	if err := json.Unmarshal([]byte(raw), &skipped); err != nil {
+		t.Fatalf("非法元素不应导致整体失败: %v", err)
+	}
+	if len(skipped.Messages) != 1 {
+		t.Fatalf("应跳过非法元素，实际 %d 条", len(skipped.Messages))
+	}
+
+	var notes types.GetGroupNotificationsResponse
+	if err := json.Unmarshal([]byte(`{"notifications":[{"type":"join_request","group_id":1,
+		"notification_seq":2,"is_filtered":false,"initiator_id":3,"state":"pending","comment":""}]}`), &notes); err != nil {
+		t.Fatalf("GetGroupNotificationsResponse: %v", err)
+	}
+	if len(notes.Notifications) != 1 {
+		t.Fatalf("通知数量 = %d", len(notes.Notifications))
+	}
+	if _, ok := notes.Notifications[0].(*types.GroupJoinRequestNotification); !ok {
+		t.Fatalf("通知类型 = %T", notes.Notifications[0])
+	}
+}

@@ -7,6 +7,13 @@
 
 ### 修复
 
+- **响应含联合类型字段时无法解码**：`get_message`（`message`）、`get_history_messages`
+  （`messages`）、`get_group_notifications`（`notifications`）的字段类型是接口
+  （`IncomingMessage` / `GroupNotification`），`encoding/json` 无法填充，调用会报
+  `cannot unmarshal object into Go struct field ...`。现在生成器为这些响应产出自定义
+  `UnmarshalJSON`：用影子结构体解出其它字段，再按判别字段逐个解码联合值；
+  数组中的非法元素跳过（兼容性契约 C3）。由本地协议端联调发现。
+
 - **Windows**：`segment.URI` 把盘符路径（`C:\dir\a.png`）误判为 URI scheme `c` 而报错；
   现按「Windows 盘符 / UNC / POSIX 绝对路径 / 无 scheme 相对路径」优先识别本地路径。
 - **Windows**：`segment.FileURI` 输出 `file://C:/dir/a.png`（缺第三个斜杠），

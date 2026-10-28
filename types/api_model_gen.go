@@ -2,6 +2,12 @@
 
 package types
 
+import (
+	"encoding/json"
+	"fmt"
+	"github.com/WinterChocolates/YukiChoco/internal/jsonx"
+)
+
 // GetLoginInfoResponse 获取登录信息的响应数据。
 type GetLoginInfoResponse struct {
 	// 登录 QQ 号
@@ -278,6 +284,25 @@ type GetMessageResponse struct {
 	Message IncomingMessage `json:"message"`
 }
 
+// UnmarshalJSON 解码联合类型字段（联合是接口，encoding/json 不能直接填充）。
+func (v *GetMessageResponse) UnmarshalJSON(b []byte) error {
+	type shadow struct {
+		Message json.RawMessage `json:"message"`
+	}
+	var s shadow
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	if len(s.Message) > 0 && string(s.Message) != "null" {
+		decoded, err := UnmarshalIncomingMessage(s.Message)
+		if err != nil {
+			return fmt.Errorf("types: 解码 GetMessageResponse.Message 失败: %w", err)
+		}
+		v.Message = decoded
+	}
+	return nil
+}
+
 // GetHistoryMessagesRequest 获取历史消息列表的请求参数。
 type GetHistoryMessagesRequest struct {
 	// 消息场景
@@ -296,6 +321,34 @@ type GetHistoryMessagesResponse struct {
 	Messages []IncomingMessage `json:"messages"`
 	// 下一页起始消息序列号
 	NextMessageSeq *MessageSeq `json:"next_message_seq,omitempty"`
+}
+
+// UnmarshalJSON 解码联合类型字段（联合是接口，encoding/json 不能直接填充）。
+func (v *GetHistoryMessagesResponse) UnmarshalJSON(b []byte) error {
+	type shadow struct {
+		Messages       []json.RawMessage `json:"messages"`
+		NextMessageSeq *MessageSeq       `json:"next_message_seq,omitempty"`
+	}
+	var s shadow
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	v.NextMessageSeq = s.NextMessageSeq
+	if len(s.Messages) > 0 {
+		v.Messages = make([]IncomingMessage, 0, len(s.Messages))
+		for i, item := range s.Messages {
+			if len(item) == 0 || string(item) == "null" {
+				continue
+			}
+			decoded, err := UnmarshalIncomingMessage(item)
+			if err != nil {
+				jsonx.Report(err, fmt.Sprintf("GetHistoryMessagesResponse.Messages[%d]", i))
+				continue
+			}
+			v.Messages = append(v.Messages, decoded)
+		}
+	}
+	return nil
 }
 
 // GetResourceTempURLRequest 获取临时资源链接的请求参数。
@@ -623,6 +676,34 @@ type GetGroupNotificationsResponse struct {
 	Notifications []GroupNotification `json:"notifications"`
 	// 下一页起始通知序列号
 	NextNotificationSeq *int64 `json:"next_notification_seq,omitempty"`
+}
+
+// UnmarshalJSON 解码联合类型字段（联合是接口，encoding/json 不能直接填充）。
+func (v *GetGroupNotificationsResponse) UnmarshalJSON(b []byte) error {
+	type shadow struct {
+		Notifications       []json.RawMessage `json:"notifications"`
+		NextNotificationSeq *int64            `json:"next_notification_seq,omitempty"`
+	}
+	var s shadow
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	v.NextNotificationSeq = s.NextNotificationSeq
+	if len(s.Notifications) > 0 {
+		v.Notifications = make([]GroupNotification, 0, len(s.Notifications))
+		for i, item := range s.Notifications {
+			if len(item) == 0 || string(item) == "null" {
+				continue
+			}
+			decoded, err := UnmarshalGroupNotification(item)
+			if err != nil {
+				jsonx.Report(err, fmt.Sprintf("GetGroupNotificationsResponse.Notifications[%d]", i))
+				continue
+			}
+			v.Notifications = append(v.Notifications, decoded)
+		}
+	}
+	return nil
 }
 
 // AcceptGroupRequestRequest 同意入群/邀请他人入群请求的请求参数。
