@@ -36,6 +36,12 @@ var (
 
 	// ErrProtocolFailure 表示 status=failed 但 retcode 未在规范中定义。
 	ErrProtocolFailure = errors.New("milky: 协议端返回失败")
+
+	// ErrAlreadyStarted 表示 Start 被重复调用。
+	ErrAlreadyStarted = errors.New("milky: 客户端已启动")
+
+	// ErrNotSupported 表示该能力尚未实现或不被当前配置支持。
+	ErrNotSupported = errors.New("milky: 当前版本不支持该能力")
 )
 
 // 协议规范中定义的 retcode。

@@ -10,6 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
+
+	"github.com/WinterChocolates/YukiChoco/event"
 	"github.com/WinterChocolates/YukiChoco/types"
 )
 
@@ -51,10 +54,94 @@ type Config struct {
 	DebugDump io.Writer
 
 	// MaxResponseBytes 限制单次响应体大小，防止异常响应耗尽内存。
-	//
-	// 零值默认 16 MiB。
+	// 同时作为事件通道单条消息的上限。零值默认 16 MiB。
 	MaxResponseBytes int64
+
+	// EventSource 选择事件通道类型。零值等价于 EventSourceWS（不调用 Start 则不建连接）。
+	EventSource EventSourceKind
+
+	// EventURL 覆盖自动推导的事件通道地址。
+	//
+	// 留空时由 BaseURL 推导：http→ws、https→wss，路径为 /event。
+	EventURL string
+
+	// WSDialer 可注入自定义 WebSocket dialer（代理、TLS、握手头等）。
+	WSDialer *websocket.Dialer
+
+	// DialTimeout 是事件通道单次拨号超时。零值默认 10s。
+	DialTimeout time.Duration
+
+	// IdleTimeout 是事件通道读空闲超时：超过该时间没有任何帧（含 pong）即判定
+	// 连接已死并重连。零值默认 90s。
+	IdleTimeout time.Duration
+
+	// PingInterval 是 WebSocket ping 间隔，用于探测半开连接。零值默认 30s。
+	PingInterval time.Duration
+
+	// Reconnect 控制事件通道的自动重连。
+	Reconnect ReconnectConfig
+
+	// Dispatch 控制事件分发。
+	Dispatch DispatchConfig
 }
+
+// ReconnectConfig 控制事件通道的自动重连。
+type ReconnectConfig struct {
+	// Disable 为 true 时连接断开后不再重连。
+	Disable bool
+
+	// InitialDelay 是首次重连前的等待时间。零值默认 1s。
+	InitialDelay time.Duration
+
+	// MaxDelay 是退避上限。零值默认 60s。
+	MaxDelay time.Duration
+
+	// Multiplier 是退避倍数。零值默认 2。
+	Multiplier float64
+
+	// Jitter 是抖动比例：0.2 表示等待时间在 ±20% 区间内随机。
+	// 零值默认 0.2；负值表示关闭抖动。
+	Jitter float64
+
+	// MaxAttempts 是最大重连次数，0 表示无限重连。
+	MaxAttempts int
+}
+
+// DispatchConfig 控制事件分发（细节见 event.Config）。
+type DispatchConfig struct {
+	// Workers 是并发度 / 会话分片数。零值使用 runtime.NumCPU()。
+	Workers int
+	// Buffer 是事件队列容量。零值默认 1024。
+	Buffer int
+	// Mode 是顺序策略。零值等价于 DispatchConcurrent。
+	Mode DispatchMode
+	// Backpressure 是队列满时的策略。零值等价于 BackpressureDropNewest。
+	Backpressure Backpressure
+	// HandlerTimeout 是单条事件的处理超时。零值不限。
+	HandlerTimeout time.Duration
+}
+
+// DispatchMode 是事件分发顺序策略（别名，定义在 event 包）。
+type DispatchMode = event.Mode
+
+// 分发顺序策略。
+const (
+	DispatchConcurrent        = event.ModeConcurrent
+	DispatchSequential        = event.ModeSequential
+	DispatchPerPeerSequential = event.ModePerPeerSequential
+)
+
+// Backpressure 是事件队列满时的策略（别名，定义在 event 包）。
+type Backpressure = event.Backpressure
+
+// 背压策略。
+const (
+	BackpressureDropNewest = event.BackpressureDropNewest
+	BackpressureBlock      = event.BackpressureBlock
+)
+
+// Middleware 是事件中间件（别名，定义在 event 包）。
+type Middleware = event.Middleware
 
 // RetryConfig 控制自动重试。
 //
@@ -116,6 +203,30 @@ func (c *Config) setDefaults() {
 	if c.HTTPClient == nil {
 		c.HTTPClient = &http.Client{}
 	}
+	if c.EventSource == "" {
+		c.EventSource = EventSourceWS
+	}
+	if c.DialTimeout <= 0 {
+		c.DialTimeout = 10 * time.Second
+	}
+	if c.IdleTimeout <= 0 {
+		c.IdleTimeout = 90 * time.Second
+	}
+	if c.PingInterval <= 0 {
+		c.PingInterval = 30 * time.Second
+	}
+	if c.Reconnect.InitialDelay <= 0 {
+		c.Reconnect.InitialDelay = time.Second
+	}
+	if c.Reconnect.MaxDelay <= 0 {
+		c.Reconnect.MaxDelay = 60 * time.Second
+	}
+	if c.Reconnect.Multiplier <= 0 {
+		c.Reconnect.Multiplier = 2
+	}
+	if c.Reconnect.Jitter == 0 {
+		c.Reconnect.Jitter = 0.2
+	}
 }
 
 // validate 校验配置并规范化 BaseURL。
@@ -135,13 +246,58 @@ func (c *Config) validate() error {
 		return errors.New("milky: Config.BaseURL 缺少主机名")
 	}
 	c.BaseURL = strings.TrimRight(raw, "/")
+
+	switch c.EventSource {
+	case EventSourceNone:
+		c.EventURL = ""
+	case EventSourceWS:
+		if c.EventURL == "" {
+			derived, err := deriveEventURL(c.BaseURL)
+			if err != nil {
+				return err
+			}
+			c.EventURL = derived
+		} else {
+			u, err := url.Parse(c.EventURL)
+			if err != nil {
+				return fmt.Errorf("milky: Config.EventURL 不是合法 URL: %w", err)
+			}
+			if u.Scheme != "ws" && u.Scheme != "wss" {
+				return fmt.Errorf("milky: Config.EventURL 的 scheme 必须是 ws 或 wss，实际为 %q", u.Scheme)
+			}
+		}
+	default:
+		return fmt.Errorf("milky: 不支持的事件源 %q（当前支持 %q / %q）",
+			c.EventSource, EventSourceWS, EventSourceNone)
+	}
 	return nil
+}
+
+// deriveEventURL 由 HTTP BaseURL 推导事件通道地址。
+func deriveEventURL(baseURL string) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("milky: 推导事件通道地址失败: %w", err)
+	}
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	default:
+		return "", fmt.Errorf("milky: 无法由 %q 推导事件通道地址", baseURL)
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/event"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), nil
 }
 
 // String 返回脱敏后的配置摘要，可安全写日志。
 func (c Config) String() string {
-	return fmt.Sprintf("Config{BaseURL: %s, AccessToken: %s, APITimeout: %s, Retry.MaxAttempts: %d, RateLimit.QPS: %g}",
-		c.BaseURL, redactSecret(c.AccessToken), c.APITimeout, c.Retry.MaxAttempts, c.RateLimit.QPS)
+	return fmt.Sprintf("Config{BaseURL: %s, AccessToken: %s, APITimeout: %s, Retry.MaxAttempts: %d, RateLimit.QPS: %g, EventSource: %s, EventURL: %s, Dispatch.Mode: %s}",
+		c.BaseURL, redactSecret(c.AccessToken), c.APITimeout, c.Retry.MaxAttempts, c.RateLimit.QPS,
+		c.EventSource, c.EventURL, c.Dispatch.Mode)
 }
 
 // LogValue 让 slog 输出脱敏后的配置。

@@ -322,11 +322,18 @@ Milky 是基于 NTQQ 的 QQ 机器人应用接口标准，当前版本 **1.3.0**
 │   ├── event_gen.go                # 生成：EventType + EventMeta + Event 接口 + 21 事件
 │   ├── api_model_gen.go            # 生成：65 组请求/响应
 │   └── endpoint_gen.go             # 生成：端点常量 + APISince + EndpointService
+├── client_event.go                 # Start/Shutdown/状态机/重连/原始钩子
+├── state.go                        # State 枚举
 ├── event/
-│   ├── dispatcher.go               # 队列、worker、顺序策略、背压
-│   ├── handler.go                  # 泛型 On[T]、注册表、取消订阅
-│   ├── middleware.go               # Recover/Timeout/Logger/Metrics/Dedup/ACL
-│   └── router.go                   # GroupMessage/AtMe/Prefix 谓词
+│   ├── dispatcher.go               # 队列、worker、3 种顺序策略、背压、统计
+│   ├── typed.go                    # 泛型 On[T] / Once[T]
+│   ├── middleware.go               # Recover / Timeout / Logging
+│   └── router.go                   # 谓词路由（M3）
+├── transport/
+│   ├── transport.go                # Source / Session 抽象
+│   ├── ws.go                       # WebSocket 事件源（ping/pong + 读超时）
+│   ├── sse.go                      # SSE 事件源（M3）
+│   └── webhook.go                  # WebHook http.Handler（M3）
 ├── segment/                        # 面向使用者的段构造（返回 types 接口）
 │   ├── segment.go
 │   ├── media.go                    # uri 解析、base64、大小限制
@@ -661,9 +668,33 @@ err := c.Call(ctx, "get_friend_list", map[string]any{}, &out)
 | `api_ext.go`：`SendGroupText` / `SendPrivateText` / `ReplyGroup` / `ReplyPrivate` / `SendGroupSegments` / `SendPrivateSegments` | ✅ |
 | 测试：32 个用例（请求形状、信封/retcode、HTTP 状态、幂等重试边界、ctx 取消、限流、脱敏、`Init` 缓存、关闭幂等、配置校验、退避边界）+ AST 方法覆盖度对齐 IR | ✅ |
 
-### 下一步（M2）
+### M2（已完成）
 
-WebSocket 事件源（`gorilla/websocket`，ping/pong + 读超时，不发应用层心跳）、连接状态机与自动重连、事件分发（并发 / 全局有序 / 会话有序）、泛型 `On[T]` 订阅、中间件链、`Start`/`Shutdown` 生命周期。
+| 项 | 状态 |
+| --- | --- |
+| `transport`：`Source`/`Session` 抽象（一次连接一个 Session，重连策略上移），WS 实现用 `gorilla/websocket` | ✅ |
+| WS 存活检测：ping/pong + 每次读前续期 `IdleTimeout` 读超时；**不发送应用层心跳帧**（Milky 无此概念） | ✅ |
+| 鉴权：优先 `Authorization: Bearer`，握手 401 时自动降级 `?access_token=` 重试一次（对应 FR-1.2） | ✅ |
+| 连接状态机：`Disconnected → Dialing → Connected → Reconnecting → Closed`，`State()` / `OnStateChange` / `WaitReady` | ✅ |
+| 自动重连：指数退避 + 抖动（默认 1s→60s、±20%）、`MaxAttempts`/`Disable` 可配、`ctx` 可中断 | ✅ |
+| 事件分发：`concurrent`（单队列 + N worker）/ `sequential`（全局有序）/ `per-peer`（N 队列 + 每队列 1 worker，同会话有序） | ✅ |
+| 背压：`drop-newest`（默认，计数 + WARN）/ `block`；`Close` 先等投递结束再关队列，杜绝 send on closed channel | ✅ |
+| panic 隔离：每个订阅者单独 recover（不影响同事件其它订阅者），Dispatcher 最外层再兜一层（覆盖中间件） | ✅ |
+| 中间件链：`Use(...)`，内置 `Recover` / `Timeout` / `Logging`；`HandlerTimeout` 支持每事件超时 | ✅ |
+| 泛型订阅 `On[T]` / `Once[T]`（事件类型由零值推导）；`OnEvent`、`OnRaw` 原始 JSON 钩子 | ✅ |
+| 生命周期：`Start`（不阻塞）/ `Shutdown(ctx)`（可重复、超时可控、重试会继续等待排空）/ `ErrAlreadyStarted` / `ErrClosed` | ✅ |
+| 容错：单条事件解码失败只跳过该条，不中断连接；`EventSourceNone` 纯 API 模式 | ✅ |
+| 测试：分发器 13 个用例（3 种顺序、2 种背压、panic、中间件顺序/短路、注销、Once、超时、排空）、transport 8 个（事件读取、401 降级、空闲检测、Close 解阻塞、ctx 取消、连接失败）、集成 10 个（typed 投递、Raw、重连、坏 JSON、状态序列、Shutdown 超时重试、goroutine 回收） | ✅ |
+
+实现期间修正的两个真实缺陷（已由测试锁定）：
+
+1. `concurrent` 模式最初为每个 worker 建独立队列，但投递只走 `queues[0]`，导致实际完全串行 → 改为单队列 + N worker。
+2. `invokeSubscribers` 中一个订阅者 panic 会跳过同事件的其它订阅者 → 改为逐订阅者 recover。
+3. 状态回调最初每个通知起一个 goroutine，导致回调到达顺序与迁移顺序不一致（测试出现 `dialing → disconnected → connected`）→ 改为单一消费 goroutine 串行派发。
+
+### 下一步（M3）
+
+SSE 与 WebHook（`http.Handler`）事件源、`segment` 包（构造 DSL、`file://`/`base64://` 助手）、文件上传下载、`mock` 可编程假协议端、`examples/`、`event.Router` 谓词路由。
 
 ---
 

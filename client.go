@@ -6,14 +6,17 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
+	"github.com/WinterChocolates/YukiChoco/event"
+	"github.com/WinterChocolates/YukiChoco/transport"
 	"github.com/WinterChocolates/YukiChoco/types"
 )
 
 // Client 是 Milky 协议端（应用端视角）的客户端。
 //
-// 所有导出方法都可并发调用。Client 不持有事件连接——事件源在 Start 中建立
-// （见后续里程碑）；本阶段只负责 HTTP API 调用。
+// 所有导出方法都可并发调用。事件通道由 Start 启动、Shutdown 停止；
+// API 调用不依赖事件通道，因此 WebHook 部署或纯发送场景可以不启动事件源。
 type Client struct {
 	cfg     Config
 	http    *http.Client
@@ -22,10 +25,28 @@ type Client struct {
 	// ownsHTTP 表示 http 客户端由 SDK 创建，Close 时才可关闭其空闲连接。
 	ownsHTTP bool
 
-	mu     sync.RWMutex
-	selfID types.UserID
-	impl   *types.GetImplInfoResponse
-	closed bool
+	events      *event.Dispatcher
+	eventSource transport.Source
+
+	mu          sync.RWMutex
+	selfID      types.UserID
+	impl        *types.GetImplInfoResponse
+	closed      bool
+	started     bool
+	shutdown    bool
+	loopCancel  context.CancelFunc
+	loopDone    chan struct{}
+	stateHooks  []stateHook
+	nextStateID atomic.Uint64
+	rawHooks    []rawHook
+	nextRawID   atomic.Uint64
+
+	state     atomic.Int32
+	ready     chan struct{}
+	readyOnce sync.Once
+	closedCh  chan struct{}
+	stateCh   chan State
+	stateDone chan struct{}
 
 	system  SystemService
 	message MessageService
@@ -45,12 +66,38 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	c := &Client{
-		cfg:      cfg,
-		http:     cfg.HTTPClient,
-		logger:   cfg.Logger,
-		limiter:  newTokenBucket(cfg.RateLimit),
-		ownsHTTP: ownsHTTP,
+		cfg:       cfg,
+		http:      cfg.HTTPClient,
+		logger:    cfg.Logger,
+		limiter:   newTokenBucket(cfg.RateLimit),
+		ownsHTTP:  ownsHTTP,
+		ready:     make(chan struct{}),
+		closedCh:  make(chan struct{}),
+		stateCh:   make(chan State, 16),
+		stateDone: make(chan struct{}),
+		events: event.New(event.Config{
+			Workers:        cfg.Dispatch.Workers,
+			Buffer:         cfg.Dispatch.Buffer,
+			Mode:           cfg.Dispatch.Mode,
+			Backpressure:   cfg.Dispatch.Backpressure,
+			HandlerTimeout: cfg.Dispatch.HandlerTimeout,
+			Logger:         cfg.Logger,
+		}),
 	}
+	switch cfg.EventSource {
+	case EventSourceWS:
+		c.eventSource = transport.NewWS(transport.WSConfig{
+			URL:             cfg.EventURL,
+			AccessToken:     cfg.AccessToken,
+			Dialer:          cfg.WSDialer,
+			DialTimeout:     cfg.DialTimeout,
+			IdleTimeout:     cfg.IdleTimeout,
+			PingInterval:    cfg.PingInterval,
+			MaxMessageBytes: cfg.MaxResponseBytes,
+			Logger:          cfg.Logger,
+		})
+	}
+	go c.notifyStates()
 	c.system = newSystemService(c)
 	c.message = newMessageService(c)
 	c.friend = newFriendService(c)
@@ -129,10 +176,10 @@ func (c *Client) ProtocolInfo() (*types.GetImplInfoResponse, bool) {
 	return &info, true
 }
 
-// Close 关闭客户端：之后的调用返回 ErrClosed。
+// Close 关闭客户端：之后的调用返回 ErrClosed，事件循环会被取消。
 //
 // 仅当 http 客户端由 SDK 创建时才会关闭其空闲连接；注入的客户端交由调用方管理。
-// Close 可重复调用。
+// 需要优雅停止事件处理请用 Shutdown。
 func (c *Client) Close() error {
 	c.mu.Lock()
 	if c.closed {
@@ -140,8 +187,13 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
+	cancel := c.loopCancel
+	close(c.closedCh)
 	c.mu.Unlock()
 
+	if cancel != nil {
+		cancel()
+	}
 	if c.ownsHTTP {
 		c.http.CloseIdleConnections()
 	}

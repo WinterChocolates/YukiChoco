@@ -10,7 +10,7 @@ import "github.com/WinterChocolates/YukiChoco"
 - **应用端**：本 SDK（通过 HTTP 调 `/api/{endpoint}`，通过 WebSocket / SSE / WebHook 收事件）
 - **不是**：QQ 协议实现、bot 框架（无插件/权限系统）、OneBot 兼容层
 
-> 当前状态：**M0–M1 已完成** —— 协议数据模型（IR 生成）、HTTP API 调用层（65 个强类型方法 + `Call` 逃生舱）、幂等重试、限流、脱敏日志与契约测试。事件订阅（WS/SSE/WebHook）在 M2。见 [Roadmap](#roadmap)。
+> 当前状态：**M0–M2 已完成** —— IR 生成的协议数据模型、HTTP API 调用层（65 个强类型方法 + `Call` 逃生舱）、WebSocket 事件通道（状态机 + 自动重连 + 分发器 + 泛型订阅 + 中间件）。SSE / WebHook 与 `segment` DSL 在 M3。见 [Roadmap](#roadmap)。
 
 ---
 
@@ -24,6 +24,8 @@ import "github.com/WinterChocolates/YukiChoco"
 | 语义化 ID | `UserID` / `GroupID` / `Uin` / `MessageSeq` 各自独立类型，编译期阻断群号与 QQ 号串用 |
 | 零第三方依赖 | 当前仅标准库；WebSocket 在 M2 引入 `gorilla/websocket` |
 | API 调用层 | 65 个强类型方法挂在 5 个 service 上（`c.Group().SendMessage(...)`），`context` 全链路，统一信封解析与 `retcode` 归类 |
+| 事件通道 | WebSocket 事件源（ping/pong + 读超时，**不发**应用层心跳）、连接状态机、指数退避重连、可注入 dialer（代理/TLS） |
+| 分发策略 | 并发 / 全局有序 / **按会话有序**（同群有序、跨群并行）；队列满可丢弃或阻塞；panic 隔离；泛型 `YukiChoco.On[T]` 订阅 + 中间件链 |
 | 可校验 | golden 测试锁定生成物、AST 校验方法覆盖度、负例测试阻断协议漂移、`-race` 全绿 |
 
 ---
@@ -173,19 +175,37 @@ if _, err := c.Group().Quit(ctx, &types.QuitGroupRequest{GroupID: 1}); err != ni
 }
 ```
 
-### 4. 事件订阅（M2 落地后可用）
+### 4. 事件订阅（M2 起可用）
 
 ```go
-c, _ := YukiChoco.New(YukiChoco.Config{
+c, err := YukiChoco.New(YukiChoco.Config{
 	BaseURL:     "http://127.0.0.1:6700",
 	AccessToken: "your-token",
-	EventSource: YukiChoco.EventSourceWS, // webhook / sse / none
+	EventSource: YukiChoco.EventSourceWS, // 或 EventSourceNone：只调 API
+	Dispatch: YukiChoco.DispatchConfig{
+		Mode:    YukiChoco.DispatchPerPeerSequential, // 同一会话有序、跨会话并行
+		Workers: 8,
+		Buffer:  1024,
+	},
+	Reconnect: YukiChoco.ReconnectConfig{
+		InitialDelay: time.Second,
+		MaxDelay:     60 * time.Second,
+		// Jitter 默认 0.2（±20%）；Disable 可关闭重连
+	},
 })
+if err != nil {
+	panic(err)
+}
 
-self := c.SelfID()
-c.OnMessageReceive(func(ctx context.Context, ev *types.MessageReceiveEvent) error {
+ctx := context.Background()
+if err := c.Init(ctx); err != nil { // 拿到 SelfID 与协议端信息
+	panic(err)
+}
+
+// 泛型订阅：事件类型由回调参数推导，不需要手写 event_type 字符串
+YukiChoco.On(c, func(ctx context.Context, ev *types.MessageReceiveEvent) error {
 	msg, ok := ev.GroupMessage()
-	if !ok || !msg.Segments.Mentioned(self) {
+	if !ok || !msg.Segments.Mentioned(c.SelfID()) {
 		return nil
 	}
 	_, err := c.Group().SendMessage(ctx, msg.Group.GroupID,
@@ -195,11 +215,32 @@ c.OnMessageReceive(func(ctx context.Context, ev *types.MessageReceiveEvent) erro
 	return err
 })
 
-if err := c.Start(context.Background()); err != nil {
+if err := c.Start(ctx); err != nil { // 启动事件循环（不阻塞）
 	panic(err)
 }
-defer c.Shutdown(context.Background())
+defer c.Shutdown(ctx) // 停止循环 + 排空队列 + 关闭客户端
+
+readyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+defer cancel()
+if err := c.WaitReady(readyCtx); err != nil { // 等首次连接成功
+	panic(err)
+}
+
+select {} // 或用 signal.NotifyContext 等待退出信号
 ```
+
+其他事件层能力：
+
+| 能力 | 用法 |
+| --- | --- |
+| 订阅所有事件 | `c.OnEvent(func(ctx, ev types.Event) error {...})` |
+| 原始 JSON 钩子 | `c.OnRaw(func(ctx, raw []byte) error {...})`（同步调用，需快速返回） |
+| 一次性订阅 | `YukiChoco.Once(c, func(ctx, ev *types.GroupMemberIncreaseEvent) error {...})` |
+| 中间件 | `c.Use(event.Recover(logger, nil), event.Timeout(3*time.Second), event.Logging(logger, slog.LevelDebug))` |
+| 状态观察 | `c.State()` / `c.OnStateChange(func(s YukiChoco.State){...})` / `c.WaitReady(ctx)` |
+| 运行统计 | `c.Events().Stats()`（handled / failed / dropped / panicked / queued） |
+
+**事件语义**：Milky 没有 ack 与序号重放，事件通道断开期间的事件会**丢失**，重连后不补发。需要严格不丢时请用 `BackpressureBlock` 并配合 `get_history_messages` 对账。
 
 ---
 
@@ -208,7 +249,8 @@ defer c.Shutdown(context.Background())
 ```
 github.com/WinterChocolates/YukiChoco     package YukiChoco  ← Client / Config / 5 个 service / 事件分发（M2）
 ├── types                                 协议数据模型：实体 / 事件 / 消息段 / API 模型（已可用）
-├── event                                 事件分发、泛型 On[T]、中间件、路由（M2）
+├── event                                 事件分发（并发/有序/按会话）、泛型 On[T]、中间件（已可用）
+├── transport                             事件源抽象 + WebSocket 实现（已可用）；SSE/WebHook（M3）
 ├── segment                               消息段构造 DSL、媒体 uri 助手（M3）
 ├── mock                                  可编程假协议端，用于测试（M3）
 ├── internal/jsonx                        宽容整数、Tagged 编解码、跳过非法元素
@@ -272,6 +314,7 @@ go test -race ./...
 | --- | --- | --- |
 | **M0** | 单模块骨架；IR 锁定；`internal/jsonx`；`internal/codegen`；`types` 全量生成；契约与行为测试 | ✅ 完成 |
 | **M1** | `Client` / `Config`；`apicall.go`（信封解析、幂等重试、限流、脱敏日志、`Call` 逃生舱）；5 个 service（65 方法）生成；`errors.go`；32 个测试用例 | ✅ 完成 |
+| **M2** | `transport`（WS + ping/pong + 读超时 + 401 降级 query token）、`event`（3 种分发策略 / 背压 / panic 隔离 / 中间件 / 泛型 `On[T]`）、`Start`/`Shutdown`/`WaitReady` 状态机与重连 | ✅ 完成 |
 | **M2** | WebSocket 事件源、连接状态机与自动重连、事件分发（并发 / 全局有序 / 会话有序）、中间件、泛型 `On[T]` | 计划 |
 | **M3** | SSE、WebHook（`http.Handler`）、`segment` DSL、文件上传下载、`mock` 协议端、`examples/` | 计划 |
 | **M4** | 与 Lagrange.Milky 真机 e2e、benchmark、发布 v0.1.0 | 计划 |
