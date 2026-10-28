@@ -8,8 +8,7 @@ import (
 
 // UserID 是 QQ 号。
 //
-// 协议规定为 int64。解码时额外容忍以字符串形式给出的数字，以兼容把 ID
-// 序列化为字符串的协议端实现；编码始终输出 JSON 数字。
+// OneBot v11 规定为整数，但部分实现会序列化成字符串，解码时两种形式都接受。
 type UserID int64
 
 // UnmarshalJSON 实现宽容解码（数字或数字字符串）。
@@ -25,7 +24,7 @@ func (id *UserID) UnmarshalJSON(b []byte) error {
 // MarshalJSON 以 JSON 数字形式编码。
 func (id UserID) MarshalJSON() ([]byte, error) { return jsonx.EncodeInt64(int64(id)), nil }
 
-// Int64 返回其整数值。
+// Int64 返回整数值。
 func (id UserID) Int64() int64 { return int64(id) }
 
 // String 返回十进制字符串。
@@ -50,7 +49,7 @@ func (id *GroupID) UnmarshalJSON(b []byte) error {
 // MarshalJSON 以 JSON 数字形式编码。
 func (id GroupID) MarshalJSON() ([]byte, error) { return jsonx.EncodeInt64(int64(id)), nil }
 
-// Int64 返回其整数值。
+// Int64 返回整数值。
 func (id GroupID) Int64() int64 { return int64(id) }
 
 // String 返回十进制字符串。
@@ -59,52 +58,50 @@ func (id GroupID) String() string { return strconv.FormatInt(int64(id), 10) }
 // IsZero 报告是否为零值。
 func (id GroupID) IsZero() bool { return id == 0 }
 
-// Uin 是语义上不明确的号码（协议中同时可能是 QQ 号或群号，例如 peer_id）。
-type Uin int64
+// MessageID 是消息 ID。
+//
+// 不同协议端的取值可能是负数、正数或很大的整数，统一用 int64 承载。
+type MessageID int64
 
 // UnmarshalJSON 实现宽容解码（数字或数字字符串）。
-func (u *Uin) UnmarshalJSON(b []byte) error {
+func (id *MessageID) UnmarshalJSON(b []byte) error {
 	v, err := jsonx.DecodeInt64(b)
 	if err != nil {
 		return err
 	}
-	*u = Uin(v)
+	*id = MessageID(v)
 	return nil
 }
 
 // MarshalJSON 以 JSON 数字形式编码。
-func (u Uin) MarshalJSON() ([]byte, error) { return jsonx.EncodeInt64(int64(u)), nil }
+func (id MessageID) MarshalJSON() ([]byte, error) { return jsonx.EncodeInt64(int64(id)), nil }
 
-// Int64 返回其整数值。
-func (u Uin) Int64() int64 { return int64(u) }
+// Int64 返回整数值。
+func (id MessageID) Int64() int64 { return int64(id) }
 
 // String 返回十进制字符串。
-func (u Uin) String() string { return strconv.FormatInt(int64(u), 10) }
+func (id MessageID) String() string { return strconv.FormatInt(int64(id), 10) }
 
 // IsZero 报告是否为零值。
-func (u Uin) IsZero() bool { return u == 0 }
+func (id MessageID) IsZero() bool { return id == 0 }
 
-// MessageSeq 是消息序列号（同一会话内单调递增）。
-type MessageSeq int64
+// Flag 是请求事件的标识（set_friend_add_request / set_group_add_request 使用）。
+//
+// 协议规定为字符串，但个别实现返回数字，解码时统一转成字符串。
+type Flag string
 
-// UnmarshalJSON 实现宽容解码（数字或数字字符串）。
-func (s *MessageSeq) UnmarshalJSON(b []byte) error {
-	v, err := jsonx.DecodeInt64(b)
+// UnmarshalJSON 实现宽容解码（字符串或数字）。
+func (f *Flag) UnmarshalJSON(b []byte) error {
+	s, err := jsonx.DecodeString(b)
 	if err != nil {
 		return err
 	}
-	*s = MessageSeq(v)
+	*f = Flag(s)
 	return nil
 }
 
-// MarshalJSON 以 JSON 数字形式编码。
-func (s MessageSeq) MarshalJSON() ([]byte, error) { return jsonx.EncodeInt64(int64(s)), nil }
+// MarshalJSON 以 JSON 字符串形式编码。
+func (f Flag) MarshalJSON() ([]byte, error) { return jsonx.EncodeString(string(f)) }
 
-// Int64 返回其整数值。
-func (s MessageSeq) Int64() int64 { return int64(s) }
-
-// String 返回十进制字符串。
-func (s MessageSeq) String() string { return strconv.FormatInt(int64(s), 10) }
-
-// IsZero 报告是否为零值。
-func (s MessageSeq) IsZero() bool { return s == 0 }
+// String 返回字符串值。
+func (f Flag) String() string { return string(f) }

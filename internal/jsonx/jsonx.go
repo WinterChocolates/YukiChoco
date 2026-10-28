@@ -1,13 +1,13 @@
-// Package jsonx 提供 Milky 协议编解码所需的容错工具。
+// Package jsonx 提供 OneBot v11 编解码所需的容错工具。
 //
-// Milky 的兼容性契约允许协议端在响应中增加字段、在数组中放入 SDK 尚未识别的元素，
-// 因此 SDK 的解码路径必须"宽容"：未知字段忽略、非法数组元素跳过、未知联合类型原样保留。
-// 该包集中实现这些规则，避免各处重复。
+// OneBot 实现之间对数字/字符串、消息段 data 类型、可选字段的处理并不一致，
+// SDK 的解码路径必须宽容：未知字段忽略、非法数组元素跳过、未知联合类型保留原始 JSON。
 package jsonx
 
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -28,73 +28,7 @@ func Report(err error, context string) {
 	}
 }
 
-// MarshalTagged 将 payload 包装为 {"type": tag, "data": payload}。
-//
-// payload 必须序列化为 JSON 对象；无字段的消息段（如 mention_all）传空结构体即可。
-func MarshalTagged(tag string, payload any) ([]byte, error) {
-	if payload == nil {
-		payload = struct{}{}
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("jsonx: 序列化 %q 的消息段数据失败: %w", tag, err)
-	}
-	// 无字段的消息段（如 mention_all）可能以 nil 指针传入。
-	if string(data) == "null" {
-		data = []byte("{}")
-	}
-	if len(data) == 0 || data[0] != '{' {
-		return nil, fmt.Errorf("jsonx: %q 的消息段数据必须是 JSON 对象，实际为 %s", tag, data)
-	}
-	tagJSON, err := json.Marshal(tag)
-	if err != nil {
-		return nil, fmt.Errorf("jsonx: 序列化标记 %q 失败: %w", tag, err)
-	}
-	out := make([]byte, 0, len(tagJSON)+len(data)+24)
-	out = append(out, `{"type":`...)
-	out = append(out, tagJSON...)
-	out = append(out, `,"data":`...)
-	out = append(out, data...)
-	out = append(out, '}')
-	return out, nil
-}
-
-// TaggedPeek 读取 JSON 对象中 tagField 的字符串值（用于判别联合类型）。
-func TaggedPeek(b []byte, tagField string) (string, error) {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(b, &m); err != nil {
-		return "", fmt.Errorf("jsonx: 解析 %s 字段所在的 JSON 失败: %w", tagField, err)
-	}
-	raw, ok := m[tagField]
-	if !ok {
-		return "", fmt.Errorf("jsonx: 缺少判别字段 %q", tagField)
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", fmt.Errorf("jsonx: 判别字段 %q 不是字符串: %w", tagField, err)
-	}
-	return s, nil
-}
-
-// TaggedData 取出 JSON 对象中的 data 子对象。
-//
-// data 缺失或为 null 时返回空对象 {}，以兼容省略空数据的协议端实现。
-func TaggedData(b []byte) (json.RawMessage, error) {
-	var holder struct {
-		Data json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(b, &holder); err != nil {
-		return nil, fmt.Errorf("jsonx: 提取 data 失败: %w", err)
-	}
-	if len(holder.Data) == 0 || string(holder.Data) == "null" {
-		return json.RawMessage("{}"), nil
-	}
-	return holder.Data, nil
-}
-
-// DecodeInt64 解码 JSON 整数，同时容忍以字符串形式给出的数字（如 "123456789"）。
-//
-// 浮点数（如 12345.0）视为非法：Milky 规范中 ID 与 seq 均为整数。
+// DecodeInt64 解码 JSON 整数，同时容忍字符串形式的数字与整数值浮点数。
 func DecodeInt64(b []byte) (int64, error) {
 	s := strings.TrimSpace(string(b))
 	switch s {
@@ -111,14 +45,63 @@ func DecodeInt64(b []byte) (int64, error) {
 			return 0, nil
 		}
 	}
-	v, err := strconv.ParseInt(s, 10, 64)
+	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return v, nil
+	}
+	f, err := strconv.ParseFloat(s, 64)
 	if err != nil {
 		return 0, fmt.Errorf("jsonx: %q 不是合法的整数: %w", s, err)
 	}
-	return v, nil
+	if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) {
+		return 0, fmt.Errorf("jsonx: %q 不是整数", s)
+	}
+	return int64(f), nil
 }
 
 // EncodeInt64 以 JSON 数字形式编码整数。
 func EncodeInt64(v int64) []byte {
 	return strconv.AppendInt(nil, v, 10)
+}
+
+// DecodeString 解码字符串，同时容忍数字与布尔（转成其字面量形式）。
+func DecodeString(b []byte) (string, error) {
+	s := strings.TrimSpace(string(b))
+	switch s {
+	case "", "null":
+		return "", nil
+	}
+	if s[0] == '"' {
+		var v string
+		if err := json.Unmarshal(b, &v); err != nil {
+			return "", fmt.Errorf("jsonx: 解析字符串失败: %w", err)
+		}
+		return v, nil
+	}
+	if s[0] == '{' || s[0] == '[' {
+		return "", fmt.Errorf("jsonx: 期望标量，实际为 %s", s)
+	}
+	return s, nil
+}
+
+// EncodeString 以 JSON 字符串形式编码。
+func EncodeString(s string) ([]byte, error) { return json.Marshal(s) }
+
+// DecodeArray 逐个解码数组元素，跳过非法元素而不是整体失败。
+//
+// context 仅用于错误上报，便于定位是哪个字段的数据有问题。
+func DecodeArray[T any](b []byte, context string) ([]T, error) {
+	var raws []json.RawMessage
+	if err := json.Unmarshal(b, &raws); err != nil {
+		return nil, err
+	}
+	out := make([]T, 0, len(raws))
+	for i, raw := range raws {
+		var v T
+		if err := json.Unmarshal(raw, &v); err != nil {
+			Report(fmt.Errorf("jsonx: 第 %d 个元素解码失败: %w", i, err), context)
+			continue
+		}
+		out = append(out, v)
+	}
+	return out, nil
 }

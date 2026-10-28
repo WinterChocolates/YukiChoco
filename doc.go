@@ -1,30 +1,27 @@
-// Package YukiChoco 是 Milky 协议（1.3）的 Go SDK。
+// Package YukiChoco 是 OneBot v11 的 Go SDK。
 //
 // # 定位
 //
-// 本包是 Milky 协议的**应用端**实现，负责与协议端（如 Lagrange.Milky、Yogurt、
-// LuckyLilliaBot）通信：通过 HTTP 调用 /api/{endpoint}，通过 WebSocket / SSE /
-// WebHook 接收事件。它不实现 QQ 协议本身、不依赖任何 bot 框架，可作为其它框架的
-// 底层协议库。
+// 本包是 OneBot v11 的**应用端**实现：通过 HTTP 或 WebSocket 调用协议端 API，
+// 通过正向 WebSocket / 反向 WebSocket / WebHook 接收事件。它不实现 QQ 协议，
+// 也不依赖任何 bot 框架，可作为其它框架的底层协议库。
 //
 // # 导入
 //
-// 模块路径与包名一致，导入后按包名调用：
-//
 //	import "github.com/WinterChocolates/YukiChoco"
 //
-//	c, err := YukiChoco.New(YukiChoco.Config{BaseURL: "http://127.0.0.1:6700"})
+//	c, err := YukiChoco.New(YukiChoco.Config{
+//	    Transport: YukiChoco.TransportForwardWS,
+//	    ForwardWS: YukiChoco.ForwardWSConfig{URL: "ws://127.0.0.1:3001/"},
+//	})
 //
 // # 协议基线
 //
-// 对齐 Milky 1.3（1.3.0）。协议数据模型（types 子包）由官方 Milky IR 生成，
-// 非手写；协议升级时执行 `make generate` 重新生成。
+// 对齐 OneBot v11（11.0），并实现文档中标注为「扩展」的常用 go-cqhttp 动作。
+// 未知事件、未知消息段、未知字段不会导致解码失败；发送消息默认使用数组格式，
+// 接收同时支持数组与 CQ 码字符串。
 //
-// # 兼容性
+// # 事件语义
 //
-// 依据官方兼容性契约，SDK 对协议端的演进是宽容的：未知事件、未知消息段、
-// 未知枚举值都保留原始 JSON 而不是解码失败；消息段列表中的非法元素会被跳过。
-//
-// 事件语义需注意：Milky 没有 ack 与序号重放，事件源断开期间的事件会丢失，
-// 不能依赖重连补发。
+// OneBot v11 没有 ack 与序号重放，事件通道断开期间的事件会丢失，SDK 不承诺重连补发。
 package YukiChoco

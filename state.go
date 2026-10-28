@@ -1,21 +1,18 @@
 package YukiChoco
 
-// State 是事件连接状态。
-//
-// 使用 EventSourceNone（纯 API 模式）时，Start 会直接进入 StateConnected，
-// 表示客户端已可用（但没有事件通道）。
+// State 是客户端事件连接的状态。
 type State int32
 
 const (
-	// StateDisconnected 表示尚未启动，或事件通道已停止。
+	// StateDisconnected 表示尚未启动，或连接已停止。
 	StateDisconnected State = iota
 	// StateDialing 表示正在建立事件连接。
 	StateDialing
-	// StateConnected 表示事件通道已建立（收到的事件可交付）。
+	// StateConnected 表示事件通道已建立（反向 WS 模式表示服务已在监听）。
 	StateConnected
-	// StateReconnecting 表示连接已断开，正在按退避策略重连。
+	// StateReconnecting 表示连接断开，正在按退避策略重连。
 	StateReconnecting
-	// StateClosed 表示客户端已 Shutdown。
+	// StateClosed 表示客户端已关闭。
 	StateClosed
 )
 

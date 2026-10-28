@@ -12,9 +12,6 @@ import (
 )
 
 // Recover 捕获处理链中的 panic，记录日志并计入统计。
-//
-// Dispatcher 总会把它装在链的最外层，因此用户中间件里的 panic 同样不会
-// 影响事件循环；这里导出是为了在自定义链（见 Chain）中复用。
 func Recover(logger *slog.Logger, counter *atomic.Uint64) Middleware {
 	return func(next Handler) Handler {
 		return func(ctx context.Context, ev types.Event) (err error) {
@@ -23,12 +20,12 @@ func Recover(logger *slog.Logger, counter *atomic.Uint64) Middleware {
 					if counter != nil {
 						counter.Add(1)
 					}
-					logger.Error("milky: 事件处理器 panic",
+					logger.Error("yukichoco: 事件处理器 panic",
 						"event_type", ev.EventType(),
 						"panic", fmt.Sprint(r),
 						"stack", string(debug.Stack()),
 					)
-					err = fmt.Errorf("milky: 事件处理器 panic: %v", r)
+					err = fmt.Errorf("yukichoco: 事件处理器 panic: %v", r)
 				}
 			}()
 			return next(ctx, ev)
@@ -59,15 +56,25 @@ func Logging(logger *slog.Logger, level slog.Level) Middleware {
 		return func(ctx context.Context, ev types.Event) error {
 			started := time.Now()
 			err := next(ctx, ev)
-			attrs := []any{
+			logger.Log(ctx, level, "yukichoco: 事件处理完成",
 				"event_type", ev.EventType(),
+				"self_id", ev.EventSelfID().Int64(),
 				"elapsed_ms", time.Since(started).Milliseconds(),
-			}
-			if err != nil {
-				attrs = append(attrs, "err", err)
-			}
-			logger.Log(ctx, level, "milky: 处理事件", attrs...)
+				"err", err,
+			)
 			return err
+		}
+	}
+}
+
+// Filter 只把匹配的事件传给后续链（不匹配时直接返回 nil）。
+func Filter(pred func(types.Event) bool) Middleware {
+	return func(next Handler) Handler {
+		return func(ctx context.Context, ev types.Event) error {
+			if pred != nil && !pred(ev) {
+				return nil
+			}
+			return next(ctx, ev)
 		}
 	}
 }

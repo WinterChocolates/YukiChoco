@@ -1,179 +1,132 @@
 package transport
 
 import (
-	"context"
+	"crypto/hmac"
+	"crypto/sha1"
 	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
-	"sync"
+	"strings"
 	"sync/atomic"
 )
 
-const defaultWebHookBuffer = 256
-
-// WebHookConfig 是 WebHook 事件源的配置。
-type WebHookConfig struct {
-	// AccessToken 非空且 VerifyToken 为 true 时，校验
-	// `Authorization: Bearer <AccessToken>`。
+// WebhookConfig 是 WebHook 事件接收器配置。
+type WebhookConfig struct {
+	// AccessToken 非空且 VerifyToken 为 true 时校验
+	// `Authorization: Bearer <AccessToken>` 或 `?access_token=`。
 	AccessToken string
 
-	// VerifyToken 控制是否校验 Authorization 头。
-	//
-	// Milky 1.1 起 WebHook 支持基于 Authorization 的鉴权，但协议端不保证发送；
-	// 因此默认关闭，需要时显式开启。
+	// VerifyToken 控制是否校验 access_token（AccessToken 非空时默认开启）。
 	VerifyToken bool
 
-	// Buffer 是事件队列容量，零值默认 256。
-	//
-	// 队列满时 Handler 返回 429，由协议端决定是否重试（多数实现会丢弃）。
-	Buffer int
+	// Secret 非空时校验 `X-Signature: sha1=<hex(HMAC-SHA1(body))>`。
+	Secret string
 
-	// Logger 用于传输层日志。零值丢弃。
+	// MaxBytes 限制请求体大小，零值默认 16 MiB。
+	MaxBytes int64
+
+	// Logger 用于传输层日志，零值丢弃。
 	Logger *slog.Logger
 }
 
-func (c *WebHookConfig) setDefaults() {
-	if c.Buffer <= 0 {
-		c.Buffer = defaultWebHookBuffer
+func (c *WebhookConfig) setDefaults() {
+	if c.MaxBytes <= 0 {
+		c.MaxBytes = defaultMaxMessageBytes
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 }
 
-// WebHook 是 WebHook 事件源：协议端 POST 事件到应用端。
+// Webhook 接收协议端 POST 过来的事件。
 //
-// 与 WS/SSE 不同，它没有"连接"的概念：Handler 接收的请求被放入队列，
-// Connect 返回一个从队列读取的会话。同一个 WebHook 实例只应被一个 Client 使用。
-type WebHook struct {
-	cfg WebHookConfig
-
-	queue   chan []byte
-	dropped atomic.Uint64
-
-	closeOnce sync.Once
-	closed    chan struct{}
+// 它只做校验与读取，事件如何分发由 OnEvent 回调决定。
+type Webhook struct {
+	cfg     WebhookConfig
+	onEvent func([]byte)
+	closing atomic.Bool
 }
 
-// NewWebHook 创建 WebHook 事件源。
-func NewWebHook(cfg WebHookConfig) *WebHook {
+// NewWebhook 创建 WebHook 接收器。
+func NewWebhook(cfg WebhookConfig) *Webhook {
 	cfg.setDefaults()
-	return &WebHook{
-		cfg:    cfg,
-		queue:  make(chan []byte, cfg.Buffer),
-		closed: make(chan struct{}),
-	}
+	return &Webhook{cfg: cfg}
 }
 
-// Name 实现 Source。
-func (w *WebHook) Name() string { return SourceWebHook }
+// OnEvent 设置事件回调。回调在 HTTP 请求 goroutine 中同步执行，应尽快返回。
+func (w *Webhook) OnEvent(fn func([]byte)) { w.onEvent = fn }
 
-// Connect 实现 Source：返回从队列读取的会话，不做任何网络操作。
-func (w *WebHook) Connect(ctx context.Context) (Session, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	select {
-	case <-w.closed:
-		return nil, ErrClosed
-	default:
-	}
-	return &webhookSession{queue: w.queue, closed: w.closed, done: make(chan struct{})}, nil
-}
+// Close 标记接收器已关闭；之后的请求返回 503。
+func (w *Webhook) Close() { w.closing.Store(true) }
 
-// Handler 返回接收事件的 http.Handler，由调用方挂载到任意路径。
-//
-// 期望 POST + JSON body（与 WS 推送的格式相同），成功返回 204。
-func (w *WebHook) Handler() http.Handler {
+// Handler 返回 http.Handler。
+func (w *Webhook) Handler() http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if w.closing.Load() {
+			http.Error(rw, "closed", http.StatusServiceUnavailable)
+			return
+		}
 		if r.Method != http.MethodPost {
 			rw.Header().Set("Allow", http.MethodPost)
 			rw.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if w.cfg.VerifyToken && w.cfg.AccessToken != "" {
-			got := r.Header.Get("Authorization")
-			want := "Bearer " + w.cfg.AccessToken
-			// 常量时间比较，避免逐字符时序泄漏。
-			if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
-				w.cfg.Logger.Warn("milky/transport: WebHook 鉴权失败", "remote", r.RemoteAddr)
-				rw.WriteHeader(http.StatusUnauthorized)
-				return
-			}
-		}
-		if ct := r.Header.Get("Content-Type"); ct != "" && !hasJSONPrefix(ct) {
-			rw.WriteHeader(http.StatusUnsupportedMediaType)
-			return
-		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, defaultMaxMessageBytes))
+		body, err := io.ReadAll(io.LimitReader(r.Body, w.cfg.MaxBytes+1))
 		if err != nil {
-			rw.WriteHeader(http.StatusBadRequest)
+			http.Error(rw, "read error", http.StatusBadRequest)
 			return
 		}
-		if len(body) == 0 {
-			rw.WriteHeader(http.StatusBadRequest)
+		if int64(len(body)) > w.cfg.MaxBytes {
+			http.Error(rw, "body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
-
-		select {
-		case <-w.closed:
-			rw.WriteHeader(http.StatusServiceUnavailable)
+		if !w.authorized(r) {
+			w.cfg.Logger.Warn("transport: WebHook 鉴权失败", "remote", r.RemoteAddr)
+			http.Error(rw, "unauthorized", http.StatusUnauthorized)
 			return
-		default:
 		}
-		select {
-		case w.queue <- body:
-			rw.WriteHeader(http.StatusNoContent)
-		default:
-			w.dropped.Add(1)
-			w.cfg.Logger.Warn("milky/transport: WebHook 队列已满，拒绝事件", "buffer", w.cfg.Buffer)
-			rw.WriteHeader(http.StatusTooManyRequests)
+		if !w.verifySignature(r, body) {
+			w.cfg.Logger.Warn("transport: WebHook 签名校验失败", "remote", r.RemoteAddr)
+			http.Error(rw, "invalid signature", http.StatusForbidden)
+			return
 		}
+		if !json.Valid(body) {
+			http.Error(rw, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if w.onEvent != nil {
+			w.onEvent(body)
+		}
+		rw.WriteHeader(http.StatusNoContent)
 	})
 }
 
-func hasJSONPrefix(ct string) bool {
-	const p = "application/json"
-	if len(ct) < len(p) {
+func (w *Webhook) authorized(r *http.Request) bool {
+	if w.cfg.AccessToken == "" || !w.cfg.VerifyToken {
+		return true
+	}
+	got := strings.TrimSpace(r.Header.Get("Authorization"))
+	if got == "" && r.URL.Query().Get("access_token") != "" {
+		got = "Bearer " + r.URL.Query().Get("access_token")
+	}
+	want := "Bearer " + w.cfg.AccessToken
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func (w *Webhook) verifySignature(r *http.Request, body []byte) bool {
+	if w.cfg.Secret == "" {
+		return true
+	}
+	sig := r.Header.Get("X-Signature")
+	sig = strings.TrimPrefix(sig, "sha1=")
+	if sig == "" {
 		return false
 	}
-	return ct[:len(p)] == p
-}
-
-// Dropped 返回因队列满被拒绝的事件数。
-func (w *WebHook) Dropped() uint64 { return w.dropped.Load() }
-
-// Close 关闭事件源：之后的 Connect 返回 ErrClosed，Handler 返回 503。
-func (w *WebHook) Close() error {
-	w.closeOnce.Do(func() { close(w.closed) })
-	return nil
-}
-
-// webhookSession 从 WebHook 的队列读取事件。
-type webhookSession struct {
-	queue  <-chan []byte
-	closed chan struct{}
-	done   chan struct{}
-	once   sync.Once
-}
-
-// Next 实现 Session。
-func (s *webhookSession) Next(ctx context.Context) ([]byte, error) {
-	select {
-	case raw := <-s.queue:
-		return raw, nil
-	case <-s.done:
-		return nil, ErrClosed
-	case <-s.closed:
-		return nil, ErrClosed
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-// Close 实现 Session。
-func (s *webhookSession) Close() error {
-	s.once.Do(func() { close(s.done) })
-	return nil
+	mac := hmac.New(sha1.New, []byte(w.cfg.Secret))
+	mac.Write(body)
+	want := hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(strings.ToLower(sig)), []byte(want))
 }

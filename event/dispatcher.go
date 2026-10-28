@@ -1,4 +1,4 @@
-// Package event 负责 Milky 事件的订阅与分发。
+// Package event 负责 OneBot 事件的订阅与分发。
 //
 // 分发策略有三档：并发、全局有序、按会话有序；队列满时可丢弃或阻塞。
 // 无论用户是否安装中间件，panic 都会被捕获，单个 handler 不会拖垮事件循环。
@@ -42,12 +42,11 @@ const (
 type Backpressure string
 
 const (
-	// BackpressureDropNewest 丢弃新事件并计数，保证事件循环不被拖慢（默认）。
+	// BackpressureDropNewest 丢弃新事件并计数（默认）。
 	BackpressureDropNewest Backpressure = "drop-newest"
 	// BackpressureBlock 阻塞投递方。
 	//
-	// 事件源会停止读取 socket，长时间阻塞可能被协议端判定为超时断开；
-	// 仅在确实不能丢事件的场景使用。
+	// 事件源会停止读取 socket，长时间阻塞可能被协议端判定为超时断开。
 	BackpressureBlock Backpressure = "block"
 )
 
@@ -61,10 +60,9 @@ type Config struct {
 	Mode Mode
 	// Backpressure 是队列满时的策略。零值等价于 BackpressureDropNewest。
 	Backpressure Backpressure
-	// HandlerTimeout 是单个事件的处理超时（handler 需自行响应 ctx）。零值不限。
+	// HandlerTimeout 是单个事件的处理超时。零值不限。
 	HandlerTimeout time.Duration
-	// KeyFunc 用于 ModePerPeerSequential 的会话划分；零值使用内置规则
-	// （群消息按群号、私聊按对方 QQ 号，其它按事件类型）。
+	// KeyFunc 用于 ModePerPeerSequential 的会话划分。
 	KeyFunc func(types.Event) string
 	// Logger 用于记录 handler 错误、panic 与丢弃。零值丢弃日志。
 	Logger *slog.Logger
@@ -91,7 +89,19 @@ func (c *Config) setDefaults() {
 	}
 }
 
-// subscription 是一个已注册的处理器。
+// DefaultKeyFunc 按会话划分事件：
+// 群消息按群号，私聊按对方 QQ 号，其它按事件类型 + self_id。
+func DefaultKeyFunc(ev types.Event) string {
+	switch e := ev.(type) {
+	case *types.GroupMessageEvent:
+		return "group:" + e.GroupID.String()
+	case *types.PrivateMessageEvent:
+		return "private:" + e.UserID.String()
+	default:
+		return "event:" + string(ev.EventType()) + ":" + ev.EventSelfID().String()
+	}
+}
+
 type subscription struct {
 	id      uint64
 	handler Handler
@@ -110,7 +120,6 @@ type Dispatcher struct {
 	dropped  atomic.Uint64
 	panicked atomic.Uint64
 
-	// senders 保证 Close 不会与正在进行的投递竞争（避免 send on closed channel）。
 	senders sync.RWMutex
 
 	mu         sync.RWMutex
@@ -132,18 +141,15 @@ func New(cfg Config) *Dispatcher {
 		logger: cfg.Logger,
 		byType: make(map[types.EventType][]*subscription),
 	}
-
 	d.rebuildChain()
 
 	switch cfg.Mode {
 	case ModeSequential:
-		// 单队列 + 单 worker：全局有序。
 		d.workers = 1
 		q := make(chan types.Event, cfg.Buffer)
 		d.queues = []chan types.Event{q}
 		d.startWorkers(q, 1)
 	case ModePerPeerSequential:
-		// N 个队列，每个队列一个 worker：同一会话有序，不同会话并行。
 		d.workers = cfg.Workers
 		d.queues = make([]chan types.Event, cfg.Workers)
 		for i := range d.queues {
@@ -152,7 +158,6 @@ func New(cfg Config) *Dispatcher {
 			d.startWorkers(q, 1)
 		}
 	default:
-		// 单队列 + N 个 worker：并发处理，不保证顺序。
 		d.workers = cfg.Workers
 		q := make(chan types.Event, cfg.Buffer)
 		d.queues = []chan types.Event{q}
@@ -161,7 +166,6 @@ func New(cfg Config) *Dispatcher {
 	return d
 }
 
-// startWorkers 在同一个队列上启动 n 个 worker。
 func (d *Dispatcher) startWorkers(q chan types.Event, n int) {
 	for i := 0; i < n; i++ {
 		d.wg.Add(1)
@@ -180,10 +184,6 @@ func (d *Dispatcher) Use(mw ...Middleware) {
 	d.mu.Unlock()
 }
 
-// rebuildChain 在持锁状态下重建处理链。
-//
-// 顺序：Recover（最外层，兜住中间件与订阅者的 panic）→ 用户中间件（按注册顺序）
-// → invokeSubscribers。
 func (d *Dispatcher) rebuildChainLocked() {
 	chain := Handler(func(ctx context.Context, ev types.Event) error {
 		return d.invokeSubscribers(ctx, ev)
@@ -201,9 +201,7 @@ func (d *Dispatcher) rebuildChain() {
 }
 
 // SubscribeAll 订阅所有事件，返回取消订阅函数。
-func (d *Dispatcher) SubscribeAll(h Handler) func() {
-	return d.subscribe("", h)
-}
+func (d *Dispatcher) SubscribeAll(h Handler) func() { return d.subscribe("", h) }
 
 // SubscribeType 订阅指定事件类型，返回取消订阅函数。
 func (d *Dispatcher) SubscribeType(t types.EventType, h Handler) func() {
@@ -271,12 +269,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, ev types.Event) {
 	case q <- ev:
 	default:
 		d.dropped.Add(1)
-		d.logger.Warn("milky: 事件队列已满，丢弃事件",
+		d.logger.Warn("yukichoco: 事件队列已满，丢弃事件",
 			"event_type", ev.EventType(), "mode", string(d.cfg.Mode), "buffer", d.cfg.Buffer)
 	}
 }
 
-// queueFor 选择目标队列。
 func (d *Dispatcher) queueFor(ev types.Event) chan types.Event {
 	if d.cfg.Mode != ModePerPeerSequential || len(d.queues) == 1 {
 		return d.queues[0]
@@ -287,7 +284,6 @@ func (d *Dispatcher) queueFor(ev types.Event) chan types.Event {
 	return d.queues[int(h.Sum32())%len(d.queues)]
 }
 
-// worker 消费队列，直到队列关闭且排空。
 func (d *Dispatcher) worker(q <-chan types.Event) {
 	defer d.wg.Done()
 	for ev := range q {
@@ -295,7 +291,6 @@ func (d *Dispatcher) worker(q <-chan types.Event) {
 	}
 }
 
-// handle 执行处理链。
 func (d *Dispatcher) handle(ev types.Event) {
 	ctx := context.Background()
 	if d.cfg.HandlerTimeout > 0 {
@@ -310,13 +305,12 @@ func (d *Dispatcher) handle(ev types.Event) {
 
 	if err := chain(ctx, ev); err != nil {
 		d.failed.Add(1)
-		d.logger.Error("milky: 事件处理失败", "event_type", ev.EventType(), "err", err)
+		d.logger.Error("yukichoco: 事件处理失败", "event_type", ev.EventType(), "err", err)
 		return
 	}
 	d.handled.Add(1)
 }
 
-// invokeSubscribers 依次调用所有匹配的订阅者。
 func (d *Dispatcher) invokeSubscribers(ctx context.Context, ev types.Event) error {
 	d.mu.RLock()
 	all := append([]*subscription(nil), d.all...)
@@ -324,19 +318,18 @@ func (d *Dispatcher) invokeSubscribers(ctx context.Context, ev types.Event) erro
 	d.mu.RUnlock()
 
 	var errs []error
-	// 逐个订阅者调用：任一订阅者 panic 不影响同事件上的其它订阅者。
 	run := func(list []*subscription) {
 		for _, s := range list {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
 						d.panicked.Add(1)
-						d.logger.Error("milky: 事件订阅者 panic",
+						d.logger.Error("yukichoco: 事件订阅者 panic",
 							"event_type", ev.EventType(),
 							"panic", fmt.Sprint(r),
 							"stack", string(debug.Stack()),
 						)
-						errs = append(errs, fmt.Errorf("milky: 事件订阅者 panic: %v", r))
+						errs = append(errs, fmt.Errorf("yukichoco: 事件订阅者 panic: %v", r))
 					}
 				}()
 				if err := s.handler(ctx, ev); err != nil {
@@ -352,14 +345,13 @@ func (d *Dispatcher) invokeSubscribers(ctx context.Context, ev types.Event) erro
 
 // Close 停止接收新事件，等待队列排空与 handler 结束。
 //
-// 超时由 ctx 控制；超时返回 ctx.Err()，此时部分 handler 可能仍在运行。
+// 超时由 ctx 控制；超时返回 ctx.Err()。
 func (d *Dispatcher) Close(ctx context.Context) error {
 	d.closeOnce.Do(func() {
 		d.mu.Lock()
 		d.closed = true
 		d.mu.Unlock()
 
-		// 先等所有进行中的投递结束，再关闭队列，避免 send on closed channel。
 		d.senders.Lock()
 		for _, q := range d.queues {
 			close(q)
@@ -406,21 +398,4 @@ func (d *Dispatcher) Stats() Stats {
 		Workers:  d.workers,
 		Mode:     d.cfg.Mode,
 	}
-}
-
-// DefaultKeyFunc 是按会话分片的默认规则。
-func DefaultKeyFunc(ev types.Event) string {
-	switch e := ev.(type) {
-	case *types.MessageReceiveEvent:
-		switch m := e.Data.(type) {
-		case *types.GroupMessage:
-			return "group:" + m.PeerID.String()
-		case *types.FriendMessage:
-			return "friend:" + m.PeerID.String()
-		case *types.TempMessage:
-			return "temp:" + m.PeerID.String()
-		}
-		return "message:" + e.Meta().SelfID.String()
-	}
-	return fmt.Sprintf("%T", ev)
 }

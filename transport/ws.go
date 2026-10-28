@@ -18,51 +18,56 @@ const (
 	defaultDialTimeout     = 10 * time.Second
 	defaultIdleTimeout     = 90 * time.Second
 	defaultPingInterval    = 30 * time.Second
+	defaultWriteTimeout    = 10 * time.Second
 	defaultMaxMessageBytes = 16 << 20
-	writeTimeout           = 10 * time.Second
 )
 
-// WSConfig 是 WebSocket 事件源的配置。
-type WSConfig struct {
-	// URL 是事件通道地址，例如 ws://127.0.0.1:6700/event。
+// DialConfig 是 WebSocket 连接的配置。
+type DialConfig struct {
+	// URL 是 ws:// 或 wss:// 地址。
 	URL string
 
-	// AccessToken 用于鉴权：优先 Authorization: Bearer，握手返回 401 时
-	// 自动降级为 ?access_token= 查询参数。
+	// AccessToken 用于鉴权：优先 Authorization: Bearer，
+	// 握手返回 401 时自动降级为 ?access_token= 查询参数。
 	AccessToken string
 
 	// Header 是额外的握手请求头。
 	Header http.Header
 
-	// Dialer 可注入自定义 dialer（代理、TLS 等）。零值使用默认 dialer。
+	// Dialer 可注入自定义 dialer（代理、TLS 等）。
 	Dialer *websocket.Dialer
 
-	// DialTimeout 是单次拨号超时。零值默认 10s。
+	// DialTimeout 是拨号超时，零值默认 10s。
 	DialTimeout time.Duration
 
-	// IdleTimeout 是读空闲超时：超过该时间没有收到任何帧（含 pong）即判定
-	// 连接已死，返回错误让上层重连。零值默认 90s。
+	// IdleTimeout 是读空闲超时，零值默认 90s；负值表示不设置读超时。
 	IdleTimeout time.Duration
 
-	// PingInterval 是 ping 帧发送间隔，用于探测半开连接。零值默认 30s。
+	// PingInterval 是 ping 帧间隔，零值默认 30s；负值表示不发送 ping。
 	PingInterval time.Duration
 
-	// MaxMessageBytes 限制单条事件大小。零值默认 16 MiB。
+	// WriteTimeout 是单次写入超时，零值默认 10s。
+	WriteTimeout time.Duration
+
+	// MaxMessageBytes 限制单条消息大小，零值默认 16 MiB。
 	MaxMessageBytes int64
 
-	// Logger 用于传输层日志。零值丢弃。
+	// Logger 用于传输层日志，零值丢弃。
 	Logger *slog.Logger
 }
 
-func (c *WSConfig) setDefaults() {
+func (c *DialConfig) setDefaults() {
 	if c.DialTimeout <= 0 {
 		c.DialTimeout = defaultDialTimeout
 	}
-	if c.IdleTimeout <= 0 {
+	if c.IdleTimeout == 0 {
 		c.IdleTimeout = defaultIdleTimeout
 	}
-	if c.PingInterval <= 0 {
+	if c.PingInterval == 0 {
 		c.PingInterval = defaultPingInterval
+	}
+	if c.WriteTimeout <= 0 {
+		c.WriteTimeout = defaultWriteTimeout
 	}
 	if c.MaxMessageBytes <= 0 {
 		c.MaxMessageBytes = defaultMaxMessageBytes
@@ -75,74 +80,184 @@ func (c *WSConfig) setDefaults() {
 	}
 }
 
-// WS 是 WebSocket 事件源。
+// Conn 是一条已建立的 WebSocket JSON 连接。
 //
-// Milky 的事件通道没有应用层心跳或 opcode 帧：每条消息就是一个事件 JSON，
-// 因此这里只使用 WebSocket 自带的 ping/pong 维持与探测连接。
-type WS struct {
-	cfg WSConfig
+// Read/Write 可并发调用（写入串行化）。Close 可重复调用。
+type Conn struct {
+	ws     *websocket.Conn
+	cfg    DialConfig
+	header http.Header
+
+	writeMu   sync.Mutex
+	closeOnce sync.Once
+	closed    chan struct{}
+	pingDone  chan struct{}
 }
 
-// NewWS 创建 WebSocket 事件源。
-func NewWS(cfg WSConfig) *WS {
+// Dial 建立一条正向 WebSocket 连接。
+func Dial(ctx context.Context, cfg DialConfig) (*Conn, error) {
 	cfg.setDefaults()
-	return &WS{cfg: cfg}
-}
-
-// Name 实现 Source。
-func (w *WS) Name() string { return SourceWS }
-
-// Connect 实现 Source。
-func (w *WS) Connect(ctx context.Context) (Session, error) {
-	header := w.cfg.Header.Clone()
+	if cfg.URL == "" {
+		return nil, errors.New("transport: URL 不能为空")
+	}
+	header := cfg.Header.Clone()
 	if header == nil {
 		header = http.Header{}
 	}
-	if w.cfg.AccessToken != "" {
-		header.Set("Authorization", "Bearer "+w.cfg.AccessToken)
+	if cfg.AccessToken != "" {
+		header.Set("Authorization", "Bearer "+cfg.AccessToken)
 	}
 
-	dialCtx, cancel := context.WithTimeout(ctx, w.cfg.DialTimeout)
+	dialCtx, cancel := context.WithTimeout(ctx, cfg.DialTimeout)
 	defer cancel()
 
-	conn, resp, err := w.cfg.Dialer.DialContext(dialCtx, w.cfg.URL, header)
+	ws, resp, err := cfg.Dialer.DialContext(dialCtx, cfg.URL, header)
 	if err != nil {
-		// 握手被拒（通常是某些环境不允许自定义 Header）：降级为 query 传 token 再试一次。
-		if w.cfg.AccessToken != "" && resp != nil && resp.StatusCode == http.StatusUnauthorized {
-			if fallback, ferr := queryTokenURL(w.cfg.URL, w.cfg.AccessToken); ferr == nil {
-				w.cfg.Logger.Debug("milky/transport: Authorization 头被拒，改用 query 参数重试")
-				retryHeader := w.cfg.Header.Clone()
+		// 某些环境会拒绝自定义 Header，降级为查询参数再试一次。
+		if cfg.AccessToken != "" && resp != nil && resp.StatusCode == http.StatusUnauthorized {
+			if resp.Body != nil {
+				resp.Body.Close()
+			}
+			fallback, ferr := queryTokenURL(cfg.URL, cfg.AccessToken)
+			if ferr == nil {
+				retryHeader := cfg.Header.Clone()
 				if retryHeader == nil {
 					retryHeader = http.Header{}
 				}
-				conn, resp, err = w.cfg.Dialer.DialContext(dialCtx, fallback, retryHeader)
+				ws, resp, err = cfg.Dialer.DialContext(dialCtx, fallback, retryHeader)
 			}
 		}
-		if err != nil {
-			if resp != nil && resp.StatusCode == http.StatusUnauthorized {
+	}
+	if err != nil {
+		if resp != nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusUnauthorized {
 				return nil, fmt.Errorf("%w: %v", ErrUnauthorized, err)
 			}
-			if resp != nil && resp.StatusCode != http.StatusSwitchingProtocols {
-				return nil, fmt.Errorf("%w: %d %s", &StatusError{StatusCode: resp.StatusCode, Status: resp.Status}, resp.StatusCode, resp.Status)
-			}
-			return nil, fmt.Errorf("milky/transport: 连接 %s 失败: %w", w.cfg.URL, err)
+			return nil, &StatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 		}
+		return nil, fmt.Errorf("transport: 连接 %s 失败: %w", cfg.URL, err)
+	}
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
 	}
 
-	sess := &wsSession{
-		conn:      conn,
-		logger:    w.cfg.Logger,
-		idle:      w.cfg.IdleTimeout,
-		pingEvery: w.cfg.PingInterval,
-		pingDone:  make(chan struct{}),
-	}
-	sess.start(ctx, w.cfg.MaxMessageBytes)
-	return sess, nil
+	c := newConn(ws, cfg, header)
+	c.start()
+	return c, nil
 }
 
-// queryTokenURL 在 URL 上附加 access_token 查询参数。
-func queryTokenURL(raw, token string) (string, error) {
-	u, err := url.Parse(raw)
+func newConn(ws *websocket.Conn, cfg DialConfig, header http.Header) *Conn {
+	cfg.setDefaults()
+	ws.SetReadLimit(cfg.MaxMessageBytes)
+	c := &Conn{
+		ws:       ws,
+		cfg:      cfg,
+		header:   header,
+		closed:   make(chan struct{}),
+		pingDone: make(chan struct{}),
+	}
+	if cfg.IdleTimeout > 0 {
+		_ = ws.SetReadDeadline(time.Now().Add(cfg.IdleTimeout))
+	}
+	ws.SetPongHandler(func(string) error {
+		if cfg.IdleTimeout > 0 {
+			return ws.SetReadDeadline(time.Now().Add(cfg.IdleTimeout))
+		}
+		return nil
+	})
+	return c
+}
+
+func (c *Conn) start() {
+	if c.cfg.PingInterval <= 0 {
+		close(c.pingDone)
+		return
+	}
+	go func() {
+		defer close(c.pingDone)
+		ticker := time.NewTicker(c.cfg.PingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-c.closed:
+				return
+			case <-ticker.C:
+				deadline := time.Now().Add(c.cfg.WriteTimeout)
+				if err := c.ws.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+					c.cfg.Logger.Debug("transport: ping 发送失败，关闭连接", "err", err)
+					_ = c.Close()
+					return
+				}
+			}
+		}
+	}()
+}
+
+// Read 读取下一条消息。
+func (c *Conn) Read(ctx context.Context) ([]byte, error) {
+	select {
+	case <-c.closed:
+		return nil, ErrClosed
+	default:
+	}
+	if c.cfg.IdleTimeout > 0 {
+		_ = c.ws.SetReadDeadline(time.Now().Add(c.cfg.IdleTimeout))
+	}
+	_, data, err := c.ws.ReadMessage()
+	if err != nil {
+		if errors.Is(err, websocket.ErrCloseSent) {
+			return nil, ErrClosed
+		}
+		return nil, contextError(ctx, fmt.Errorf("transport: 读取消息失败: %w", err))
+	}
+	return data, nil
+}
+
+// Write 写入一条消息。并发安全。
+func (c *Conn) Write(ctx context.Context, data []byte) error {
+	select {
+	case <-c.closed:
+		return ErrClosed
+	default:
+	}
+	deadline := time.Now().Add(c.cfg.WriteTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_ = c.ws.SetWriteDeadline(deadline)
+	if err := c.ws.WriteMessage(websocket.TextMessage, data); err != nil {
+		return contextError(ctx, fmt.Errorf("transport: 写入消息失败: %w", err))
+	}
+	return nil
+}
+
+// Close 关闭连接（发送正常关闭帧后释放资源）。
+func (c *Conn) Close() error {
+	var err error
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		deadline := time.Now().Add(time.Second)
+		_ = c.ws.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+		err = c.ws.Close()
+	})
+	return err
+}
+
+// Done 在连接关闭后关闭。
+func (c *Conn) Done() <-chan struct{} { return c.closed }
+
+// RemoteAddr 返回对端地址。
+func (c *Conn) RemoteAddr() string { return c.ws.RemoteAddr().String() }
+
+// Header 返回握手请求头（反向 WS 中可用于读取 X-Self-ID 等）。
+func (c *Conn) Header() http.Header { return c.header.Clone() }
+
+func queryTokenURL(rawURL, token string) (string, error) {
+	u, err := url.Parse(rawURL)
 	if err != nil {
 		return "", err
 	}
@@ -150,117 +265,4 @@ func queryTokenURL(raw, token string) (string, error) {
 	q.Set("access_token", token)
 	u.RawQuery = q.Encode()
 	return u.String(), nil
-}
-
-// wsSession 是一条 WebSocket 连接。
-type wsSession struct {
-	conn      *websocket.Conn
-	logger    *slog.Logger
-	idle      time.Duration
-	pingEvery time.Duration
-
-	writeMu   sync.Mutex
-	closeOnce sync.Once
-	pingDone  chan struct{}
-	cancel    context.CancelFunc
-}
-
-// start 初始化读限制、ping/pong 处理与看门狗。
-func (s *wsSession) start(parent context.Context, maxMessage int64) {
-	s.conn.SetReadLimit(maxMessage)
-
-	// 收到 pong 说明对端还活着，续期读超时。
-	s.conn.SetPongHandler(func(string) error {
-		return s.conn.SetReadDeadline(time.Now().Add(s.idle))
-	})
-	// 自定义 ping handler 后需自行回 pong（gorilla 默认行为被覆盖）。
-	s.conn.SetPingHandler(func(data string) error {
-		s.writeMu.Lock()
-		defer s.writeMu.Unlock()
-		if err := s.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
-			return err
-		}
-		return s.conn.WriteMessage(websocket.PongMessage, []byte(data))
-	})
-
-	ctx, cancel := context.WithCancel(parent)
-	s.cancel = cancel
-
-	// 看门狗：上层取消 ctx 时关闭连接，让阻塞中的 Next 立刻返回。
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = s.Close()
-		case <-s.pingDone:
-		}
-	}()
-
-	go s.pingLoop(ctx)
-}
-
-// pingLoop 定期发送 ping 帧。
-func (s *wsSession) pingLoop(ctx context.Context) {
-	defer close(s.pingDone)
-	ticker := time.NewTicker(s.pingEvery)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.writeMu.Lock()
-			err := s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-			if err == nil {
-				err = s.conn.WriteMessage(websocket.PingMessage, nil)
-			}
-			s.writeMu.Unlock()
-			if err != nil {
-				s.logger.Debug("milky/transport: ping 失败，关闭连接", "err", err)
-				_ = s.Close()
-				return
-			}
-		}
-	}
-}
-
-// Next 实现 Session。
-func (s *wsSession) Next(ctx context.Context) ([]byte, error) {
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if err := s.conn.SetReadDeadline(time.Now().Add(s.idle)); err != nil {
-			return nil, err
-		}
-		msgType, data, err := s.conn.ReadMessage()
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			if errors.Is(err, websocket.ErrCloseSent) {
-				return nil, ErrClosed
-			}
-			return nil, fmt.Errorf("milky/transport: 读取事件失败: %w", err)
-		}
-		// 事件一定是文本消息；二进制消息按同样规则处理以兼容实现差异。
-		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
-			continue
-		}
-		if len(data) == 0 {
-			continue
-		}
-		return data, nil
-	}
-}
-
-// Close 实现 Session，可重复调用。
-func (s *wsSession) Close() error {
-	var err error
-	s.closeOnce.Do(func() {
-		if s.cancel != nil {
-			s.cancel()
-		}
-		err = s.conn.Close()
-	})
-	return err
 }

@@ -8,8 +8,7 @@ import (
 
 // tokenBucket 是限流用的令牌桶。
 //
-// 实现刻意保持极简：没有后台 goroutine，只在拿令牌时按流逝时间惰性补充，
-// 因此不产生常驻开销，Shutdown 时也不需要清理。
+// 没有后台 goroutine，只在取令牌时按流逝时间惰性补充，因此无常驻开销。
 type tokenBucket struct {
 	mu     sync.Mutex
 	qps    float64
@@ -56,7 +55,6 @@ func (b *tokenBucket) wait(ctx context.Context) error {
 			b.mu.Unlock()
 			return ctx.Err()
 		}
-		// 距离下一个令牌还需要多久。
 		need := (1 - b.tokens) / b.qps
 		b.mu.Unlock()
 

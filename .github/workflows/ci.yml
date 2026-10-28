@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, refactor/onebot-v11]
   pull_request:
 
 permissions:
@@ -40,29 +40,8 @@ jobs:
         if: runner.os == 'Linux'
         run: go test -race ./...
 
-  generate:
-    name: 生成物与 IR 一致
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-          cache: true
-
-      - name: 重新生成并检查差异
-        run: |
-          make generate
-          if ! git diff --exit-code -- types 'service_*_gen.go'; then
-            echo "::error::生成物与 protocol/protocol-1.3.0.json 不一致，请运行 make generate 并提交"
-            exit 1
-          fi
-
-      - name: 生成物 golden 测试
-        run: go test ./internal/codegen -run 'TestGolden|TestIRBaseline' -v
-
   coverage:
-    name: 覆盖率（排除生成物与示例）
+    name: 覆盖率（排除示例）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

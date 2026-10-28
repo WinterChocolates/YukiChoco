@@ -1,23 +1,12 @@
-// Package mock 提供可编程的假 Milky 协议端。
+// Package mock 提供一个可编程的假 OneBot v11 协议端。
 //
-// 它同时实现 HTTP API、WebSocket 事件流与 SSE 事件流，用于在不连接真实 QQ 的
-// 情况下测试上层代码：
-//
-//	srv := mock.New(mock.WithToken("tok"))
-//	srv.Handle("get_login_info", func(req json.RawMessage) (any, error) {
-//		return map[string]any{"uin": 10001, "nickname": "bot"}, nil
-//	})
-//	c, _ := YukiChoco.New(YukiChoco.Config{BaseURL: srv.URL(), AccessToken: "tok"})
-//	c.Start(ctx)
-//	srv.Push(eventJSON) // 推给所有已连接的客户端
-//
-// 未注册的端点默认返回成功 + 空 data（`{}`），因此测试只需注册关心的端点。
+// 它同时支持 HTTP API、正向 WebSocket 与反向 WebSocket，用于在不启动真实
+// QQ 账号的情况下编写集成测试。
 package mock
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,400 +17,373 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/WinterChocolates/YukiChoco/types"
 )
 
-// Handler 处理一个 API 请求。
+// ActionHandler 处理一个 action，返回 data 或 error。
 //
-// req 是原始 JSON body；返回值会被包进 `{"status":"ok","retcode":0,"data":...}`。
-// 返回 *APIError 时生成失败信封。
-type Handler func(req json.RawMessage) (any, error)
+// error 会被编码为 status=failed / retcode=100。
+type ActionHandler func(params json.RawMessage) (any, error)
 
-// APIError 让 Handler 返回协议层失败。
-type APIError struct {
-	Retcode int
-	Message string
-}
-
-func (e *APIError) Error() string {
-	return fmt.Sprintf("mock: retcode=%d: %s", e.Retcode, e.Message)
-}
-
-// Call 记录一次 API 调用。
+// Call 是一次被记录的动作调用。
 type Call struct {
-	Endpoint string
-	Body     json.RawMessage
-	At       time.Time
+	Action string
+	Params json.RawMessage
 }
 
-// Server 是假的 Milky 协议端。
-type Server struct {
-	srv   *httptest.Server
-	token string
-	sse   bool
+type wsClient struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
 
-	mu       sync.RWMutex
-	handlers map[string]Handler
-	fallback Handler
+func (c *wsClient) write(data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return c.conn.WriteMessage(websocket.TextMessage, data)
+}
+
+// Protocol 是假协议端。
+type Protocol struct {
+	SelfID  types.UserID
+	AppName string
+
+	server *httptest.Server
+	closed atomic.Bool
+	msgSeq atomic.Int64
+
+	mu       sync.Mutex
+	handlers map[string]ActionHandler
 	calls    []Call
-
-	connMu sync.Mutex
-	conns  map[*wsConn]struct{}
-	sses   map[chan []byte]struct{}
-
-	connCount atomic.Int32
-	closed    atomic.Bool
+	conns    map[*wsClient]struct{}
+	reverse  map[*wsClient]struct{}
 }
 
-// Option 用于配置 Server。
-type Option func(*Server)
-
-// WithToken 要求所有请求携带 `Authorization: Bearer <token>`（或事件通道的
-// `?access_token=`）。
-func WithToken(token string) Option {
-	return func(s *Server) { s.token = token }
-}
-
-// WithSSE 让 /event 提供 SSE 而不是 WebSocket。
-func WithSSE() Option {
-	return func(s *Server) { s.sse = true }
-}
-
-// New 启动假协议端。使用完毕后必须调用 Close。
-func New(opts ...Option) *Server {
-	s := &Server{
-		handlers: make(map[string]Handler),
-		conns:    make(map[*wsConn]struct{}),
-		sses:     make(map[chan []byte]struct{}),
+// New 创建并启动假协议端。
+func New(selfID types.UserID) *Protocol {
+	p := &Protocol{
+		SelfID:   selfID,
+		AppName:  "mock",
+		handlers: make(map[string]ActionHandler),
+		conns:    make(map[*wsClient]struct{}),
+		reverse:  make(map[*wsClient]struct{}),
+		msgSeq:   atomic.Int64{},
 	}
-	for _, opt := range opts {
-		opt(s)
-	}
+	p.msgSeq.Store(1000)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/", s.handleAPI)
-	mux.HandleFunc("/event", s.handleEvent)
-	s.srv = httptest.NewServer(mux)
-	return s
+	mux.HandleFunc("/", p.serve)
+	p.server = httptest.NewServer(mux)
+	return p
 }
 
-// URL 返回协议端地址，可直接作为 Config.BaseURL。
-func (s *Server) URL() string { return s.srv.URL }
+// URL 返回 HTTP API 根地址。
+func (p *Protocol) URL() string { return p.server.URL }
 
-// Close 关闭服务端与所有连接。
-func (s *Server) Close() {
-	if s.closed.Swap(true) {
+// WSURL 返回正向 WebSocket 地址（通用单连接）。
+func (p *Protocol) WSURL() string { return "ws" + strings.TrimPrefix(p.server.URL, "http") + "/" }
+
+// APIWSURL 返回正向 WebSocket 的 /api 地址（配套 EventWSURL）。
+func (p *Protocol) APIWSURL() string { return "ws" + strings.TrimPrefix(p.server.URL, "http") + "/api" }
+
+// EventWSURL 返回正向 WebSocket 的 /event 地址。
+func (p *Protocol) EventWSURL() string {
+	return "ws" + strings.TrimPrefix(p.server.URL, "http") + "/event"
+}
+
+// Close 关闭假协议端与所有连接。
+func (p *Protocol) Close() {
+	if !p.closed.CompareAndSwap(false, true) {
 		return
 	}
-	s.connMu.Lock()
-	for c := range s.conns {
-		_ = c.ws.Close()
+	p.mu.Lock()
+	for c := range p.conns {
+		_ = c.conn.Close()
 	}
-	for ch := range s.sses {
-		close(ch)
+	for c := range p.reverse {
+		_ = c.conn.Close()
 	}
-	s.conns = map[*wsConn]struct{}{}
-	s.sses = map[chan []byte]struct{}{}
-	s.connMu.Unlock()
-	s.srv.Close()
+	p.mu.Unlock()
+	p.server.Close()
 }
 
-// Handle 注册端点处理函数。
-func (s *Server) Handle(endpoint string, h Handler) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.handlers[endpoint] = h
+// On 注册 action 处理器。
+func (p *Protocol) On(action string, fn ActionHandler) {
+	p.mu.Lock()
+	p.handlers[action] = fn
+	p.mu.Unlock()
 }
 
-// OnAnyAPI 注册未匹配端点时的兜底处理函数。
-func (s *Server) OnAnyAPI(h Handler) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.fallback = h
+// Calls 返回已记录的动作调用。
+func (p *Protocol) Calls() []Call {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]Call(nil), p.calls...)
 }
 
-// Calls 返回所有已收到的 API 调用（按时间顺序）。
-func (s *Server) Calls() []Call {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]Call, len(s.calls))
-	copy(out, s.calls)
-	return out
-}
-
-// LastCall 返回指定端点的最后一次调用。
-func (s *Server) LastCall(endpoint string) (Call, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for i := len(s.calls) - 1; i >= 0; i-- {
-		if s.calls[i].Endpoint == endpoint {
-			return s.calls[i], true
-		}
+// LastCall 返回最后一次调用；没有时返回零值。
+func (p *Protocol) LastCall() (Call, bool) {
+	calls := p.Calls()
+	if len(calls) == 0 {
+		return Call{}, false
 	}
-	return Call{}, false
+	return calls[len(calls)-1], true
 }
 
-// Connected 返回当前事件连接数。
-func (s *Server) Connected() int { return int(s.connCount.Load()) }
-
-// WaitConnected 等待至少 n 条事件连接建立。
-func (s *Server) WaitConnected(ctx context.Context, n int) error {
-	ticker := time.NewTicker(2 * time.Millisecond)
+// WaitCall 等待某个 action 至少被调用一次。
+func (p *Protocol) WaitCall(ctx context.Context, action string) (Call, error) {
+	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if s.Connected() >= n {
-			return nil
+		for _, c := range p.Calls() {
+			if c.Action == action {
+				return c, nil
+			}
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return Call{}, ctx.Err()
 		case <-ticker.C:
 		}
 	}
 }
 
-// Push 把任意值序列化为事件 JSON 并推送给所有客户端。
-func (s *Server) Push(v any) error {
-	raw, err := json.Marshal(v)
+func (p *Protocol) serve(rw http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.Method == http.MethodGet && (r.URL.Path == "/" || r.URL.Path == "/api" || r.URL.Path == "/event"):
+		p.serveWS(rw, r)
+	case r.Method == http.MethodPost:
+		action := strings.TrimPrefix(r.URL.Path, "/")
+		if action == "" {
+			http.NotFound(rw, r)
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+		if err != nil {
+			http.Error(rw, "bad body", http.StatusBadRequest)
+			return
+		}
+		env := p.dispatch(action, body)
+		env.Echo = json.RawMessage(`"http"`)
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(env)
+	default:
+		http.NotFound(rw, r)
+	}
+}
+
+func (p *Protocol) serveWS(rw http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	conn, err := upgrader.Upgrade(rw, r, nil)
+	if err != nil {
+		return
+	}
+	c := &wsClient{conn: conn}
+	p.mu.Lock()
+	p.conns[c] = struct{}{}
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.conns, c)
+		p.mu.Unlock()
+		_ = conn.Close()
+	}()
+
+	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		p.handleWSFrame(c, data)
+	}
+}
+
+func (p *Protocol) handleWSFrame(c *wsClient, data []byte) {
+	var req struct {
+		Action string          `json:"action"`
+		Params json.RawMessage `json:"params"`
+		Echo   json.RawMessage `json:"echo"`
+	}
+	if err := json.Unmarshal(data, &req); err != nil || req.Action == "" {
+		return
+	}
+	env := p.dispatch(req.Action, req.Params)
+	env.Echo = req.Echo
+	raw, err := json.Marshal(env)
+	if err != nil {
+		return
+	}
+	_ = c.write(raw)
+}
+
+func (p *Protocol) dispatch(action string, params json.RawMessage) envelope {
+	p.mu.Lock()
+	p.calls = append(p.calls, Call{Action: action, Params: append(json.RawMessage(nil), params...)})
+	fn := p.handlers[action]
+	p.mu.Unlock()
+
+	if fn == nil {
+		fn = p.defaultHandler(action)
+	}
+	data, err := fn(params)
+	if err != nil {
+		return envelope{Status: "failed", Retcode: 100, Message: err.Error()}
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return envelope{Status: "failed", Retcode: 100, Message: err.Error()}
+	}
+	return envelope{Status: "ok", Retcode: 0, Data: raw}
+}
+
+func (p *Protocol) defaultHandler(action string) ActionHandler {
+	switch action {
+	case types.ActionGetLoginInfo:
+		return func(json.RawMessage) (any, error) {
+			return map[string]any{"user_id": p.SelfID, "nickname": "mock-bot"}, nil
+		}
+	case types.ActionGetVersionInfo:
+		return func(json.RawMessage) (any, error) {
+			return map[string]any{
+				"app_name": p.AppName, "app_version": "0.0.0", "protocol_version": "v11",
+			}, nil
+		}
+	case types.ActionGetStatus:
+		return func(json.RawMessage) (any, error) {
+			return map[string]any{"online": true, "good": true}, nil
+		}
+	case types.ActionGetGroupInfo:
+		return func(params json.RawMessage) (any, error) {
+			var req struct {
+				GroupID types.GroupID `json:"group_id"`
+			}
+			_ = json.Unmarshal(params, &req)
+			return map[string]any{
+				"group_id": req.GroupID, "group_name": "mock-group",
+				"member_count": 1, "max_member_count": 200,
+			}, nil
+		}
+	case types.ActionGetGroupMemberInfo:
+		return func(params json.RawMessage) (any, error) {
+			var req struct {
+				GroupID types.GroupID `json:"group_id"`
+				UserID  types.UserID  `json:"user_id"`
+			}
+			_ = json.Unmarshal(params, &req)
+			return map[string]any{
+				"group_id": req.GroupID, "user_id": req.UserID,
+				"nickname": "mock-user", "card": "",
+				"role": "member", "join_time": 0,
+			}, nil
+		}
+	case types.ActionGetFriendList:
+		return func(json.RawMessage) (any, error) {
+			return []map[string]any{{"user_id": 10001, "nickname": "friend", "remark": ""}}, nil
+		}
+	case types.ActionGetGroupList:
+		return func(json.RawMessage) (any, error) {
+			return []map[string]any{{"group_id": 20001, "group_name": "mock-group", "member_count": 1, "max_member_count": 200}}, nil
+		}
+	case types.ActionSendPrivateMsg, types.ActionSendGroupMsg, types.ActionSendMsg,
+		types.ActionSendGroupForwardMsg, types.ActionSendPrivateForwardMsg:
+		return func(json.RawMessage) (any, error) {
+			return map[string]any{"message_id": p.msgSeq.Add(1)}, nil
+		}
+	case types.ActionGetMsg:
+		return func(params json.RawMessage) (any, error) {
+			var req types.GetMsgRequest
+			_ = json.Unmarshal(params, &req)
+			return map[string]any{
+				"message_id": req.MessageID, "message_type": "group",
+				"user_id": 10001, "time": time.Now().Unix(),
+				"message": []map[string]any{{"type": "text", "data": map[string]any{"text": "mock"}}},
+			}, nil
+		}
+	}
+	return func(json.RawMessage) (any, error) { return map[string]any{}, nil }
+}
+
+// Push 向所有已连接的正向 WS 与反向 WS 客户端推送事件。
+func (p *Protocol) Push(ev types.Event) error {
+	raw, err := json.Marshal(ev)
 	if err != nil {
 		return err
 	}
-	return s.PushJSON(raw)
+	return p.PushJSON(raw)
 }
 
-// PushJSON 把原始事件 JSON 推送给所有客户端。
-//
-// 返回的 error 仅在完全没有客户端时出现；单个连接写失败会被忽略并断开。
-func (s *Server) PushJSON(raw []byte) error {
-	payload := append([]byte(nil), raw...)
-
-	s.connMu.Lock()
-	conns := make([]*wsConn, 0, len(s.conns))
-	for c := range s.conns {
+// PushJSON 推送原始事件 JSON。
+func (p *Protocol) PushJSON(raw []byte) error {
+	p.mu.Lock()
+	conns := make([]*wsClient, 0, len(p.conns)+len(p.reverse))
+	for c := range p.conns {
 		conns = append(conns, c)
 	}
-	sses := make([]chan []byte, 0, len(s.sses))
-	for ch := range s.sses {
-		sses = append(sses, ch)
+	for c := range p.reverse {
+		conns = append(conns, c)
 	}
-	s.connMu.Unlock()
-
-	if len(conns) == 0 && len(sses) == 0 {
-		return fmt.Errorf("mock: 没有已连接的事件客户端")
+	p.mu.Unlock()
+	if len(conns) == 0 {
+		return fmt.Errorf("mock: 没有已连接的 WebSocket 客户端")
 	}
+	var firstErr error
 	for _, c := range conns {
-		select {
-		case c.out <- payload:
-		default:
-			// 慢客户端：丢弃本次，避免阻塞测试。
+		if err := c.write(raw); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	for _, ch := range sses {
-		select {
-		case ch <- payload:
-		default:
-		}
+	return firstErr
+}
+
+// ConnectReverse 主动连接被测客户端的反向 WS 服务。
+//
+// 返回值在连接建立后即返回；后续事件通过 Push 发送，客户端发来的 API 请求
+// 会被记录并自动响应。
+func (p *Protocol) ConnectReverse(ctx context.Context, rawURL string, accessToken string) error {
+	header := http.Header{}
+	header.Set("X-Self-ID", p.SelfID.String())
+	header.Set("X-Client-Role", "Universal")
+	if accessToken != "" {
+		header.Set("Authorization", "Bearer "+accessToken)
 	}
+	dialer := websocket.Dialer{}
+	conn, resp, err := dialer.DialContext(ctx, rawURL, header)
+	if err != nil {
+		if resp != nil {
+			resp.Body.Close()
+			return fmt.Errorf("mock: 反向 WS 连接失败: HTTP %s: %w", resp.Status, err)
+		}
+		return err
+	}
+	c := &wsClient{conn: conn}
+	p.mu.Lock()
+	p.reverse[c] = struct{}{}
+	p.mu.Unlock()
+
+	go func() {
+		defer func() {
+			p.mu.Lock()
+			delete(p.reverse, c)
+			p.mu.Unlock()
+			_ = conn.Close()
+		}()
+		for {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			p.handleWSFrame(c, data)
+		}
+	}()
 	return nil
 }
 
-// ───────────────────────────── API ─────────────────────────────
-
-func (s *Server) handleAPI(rw http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		rw.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if !s.authorized(r) {
-		rw.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-	endpoint := strings.TrimPrefix(r.URL.Path, "/api/")
-	if endpoint == "" {
-		rw.WriteHeader(http.StatusNotFound)
-		return
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
-	if err != nil {
-		rw.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	s.mu.Lock()
-	s.calls = append(s.calls, Call{Endpoint: endpoint, Body: body, At: time.Now()})
-	h := s.handlers[endpoint]
-	if h == nil {
-		h = s.fallback
-	}
-	s.mu.Unlock()
-
-	rw.Header().Set("Content-Type", "application/json")
-	if h == nil {
-		writeOK(rw, map[string]any{})
-		return
-	}
-
-	data, err := h(body)
-	if err != nil {
-		var apiErr *APIError
-		if errors.As(err, &apiErr) {
-			_ = json.NewEncoder(rw).Encode(map[string]any{
-				"status":  "failed",
-				"retcode": apiErr.Retcode,
-				"message": apiErr.Message,
-			})
-			return
-		}
-		_ = json.NewEncoder(rw).Encode(map[string]any{
-			"status":  "failed",
-			"retcode": -500,
-			"message": err.Error(),
-		})
-		return
-	}
-	writeOK(rw, data)
-}
-
-func writeOK(rw http.ResponseWriter, data any) {
-	if data == nil {
-		data = map[string]any{}
-	}
-	_ = json.NewEncoder(rw).Encode(map[string]any{
-		"status":  "ok",
-		"retcode": 0,
-		"data":    data,
-	})
-}
-
-// ───────────────────────────── 事件通道 ─────────────────────────────
-
-func (s *Server) handleEvent(rw http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
-		rw.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-	if s.sse {
-		s.serveSSE(rw, r)
-		return
-	}
-	s.serveWS(rw, r)
-}
-
-// authorized 校验 access_token（Header 或 query）。
-func (s *Server) authorized(r *http.Request) bool {
-	if s.token == "" {
-		return true
-	}
-	if r.Header.Get("Authorization") == "Bearer "+s.token {
-		return true
-	}
-	return r.URL.Query().Get("access_token") == s.token
-}
-
-// wsConn 是一条 WS 连接及其写队列。
-type wsConn struct {
-	ws  *websocket.Conn
-	out chan []byte
-	mu  sync.Mutex
-}
-
-func (s *Server) serveWS(rw http.ResponseWriter, r *http.Request) {
-	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	ws, err := up.Upgrade(rw, r, nil)
-	if err != nil {
-		return
-	}
-	conn := &wsConn{ws: ws, out: make(chan []byte, 32)}
-
-	s.connMu.Lock()
-	s.conns[conn] = struct{}{}
-	s.connMu.Unlock()
-	s.connCount.Add(1)
-
-	// 写协程
-	go func() {
-		for payload := range conn.out {
-			conn.mu.Lock()
-			_ = ws.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			err := ws.WriteMessage(websocket.TextMessage, payload)
-			conn.mu.Unlock()
-			if err != nil {
-				_ = ws.Close()
-				return
-			}
-		}
-	}()
-
-	// 读协程：只用于感知断开与回应 ping（gorilla 默认处理 pong）。
-	for {
-		if _, _, err := ws.ReadMessage(); err != nil {
-			break
-		}
-	}
-
-	close(conn.out)
-	s.connMu.Lock()
-	delete(s.conns, conn)
-	s.connMu.Unlock()
-	s.connCount.Add(-1)
-}
-
-func (s *Server) serveSSE(rw http.ResponseWriter, r *http.Request) {
-	flusher, ok := rw.(http.Flusher)
-	if !ok {
-		rw.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	rw.Header().Set("Content-Type", "text/event-stream")
-	rw.Header().Set("Cache-Control", "no-cache")
-	rw.Header().Set("Connection", "keep-alive")
-	rw.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	ch := make(chan []byte, 32)
-	s.connMu.Lock()
-	s.sses[ch] = struct{}{}
-	s.connMu.Unlock()
-	s.connCount.Add(1)
-	defer func() {
-		s.connMu.Lock()
-		if _, ok := s.sses[ch]; ok {
-			delete(s.sses, ch)
-			close(ch)
-		}
-		s.connMu.Unlock()
-		s.connCount.Add(-1)
-	}()
-
-	keepAlive := time.NewTicker(15 * time.Second)
-	defer keepAlive.Stop()
-
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case <-keepAlive.C:
-			if _, err := fmt.Fprint(rw, ": keep-alive\n\n"); err != nil {
-				return
-			}
-			flusher.Flush()
-		case payload, ok := <-ch:
-			if !ok {
-				return
-			}
-			// 按 SSE 规范：data 内的换行需要拆成多行 data。
-			lines := strings.Split(string(payload), "\n")
-			var b strings.Builder
-			b.WriteString("event: milky_event\n")
-			for _, line := range lines {
-				b.WriteString("data: ")
-				b.WriteString(line)
-				b.WriteString("\n")
-			}
-			b.WriteString("\n")
-			if _, err := fmt.Fprint(rw, b.String()); err != nil {
-				return
-			}
-			flusher.Flush()
-		}
-	}
+// envelope 与 OneBot 响应结构一致。
+type envelope struct {
+	Status  string          `json:"status"`
+	Retcode int             `json:"retcode"`
+	Data    json.RawMessage `json:"data,omitempty"`
+	Echo    json.RawMessage `json:"echo,omitempty"`
+	Message string          `json:"message,omitempty"`
 }

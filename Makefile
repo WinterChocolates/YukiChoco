@@ -1,25 +1,21 @@
-# YukiChoco Milky SDK — 构建入口
+# YukiChoco OneBot v11 SDK — 构建入口
 #
-#   make generate   由 protocol/protocol-1.3.0.json 重新生成 types 包
-#   make check      生成 / vet / test / race 全量校验（含生成物一致性）
-#   make spec-check 拉取上游最新 Milky IR 并与本地锁定版本对比
+#   make check      格式 / vet / 测试 / race 全量校验
+#   make cover      覆盖率（排除 examples）
+#   make bench      基准测试
 
 GO ?= go
-SPEC_VERSION ?= 1.3.0
-SPEC_URL ?= https://unpkg.com/@saltify/milky-protocol@$(SPEC_VERSION)/dist/protocol.json
+PKGS := $(shell $(GO) list ./...)
 
-.PHONY: all generate fmt vet test race check cover bench spec-fetch spec-check clean
+.PHONY: all fmt vet test race check cover bench clean
 
 all: check
-
-generate:
-	$(GO) run ./internal/codegen -spec protocol/protocol-$(SPEC_VERSION).json -out types -services .
 
 fmt:
 	$(GO) fmt ./...
 
 vet:
-	$(GO) vet ./...
+	$(GO) vet $(PKGS)
 
 test:
 	$(GO) test ./...
@@ -27,27 +23,18 @@ test:
 race:
 	$(GO) test -race ./...
 
-# 生成物必须与 IR 一致且不允许手改：由 internal/codegen 的 TestGolden 兜底
-# （它把 IR 重新生成到临时目录后与仓库文件逐字节比对，不依赖 git 状态）。
-check: generate fmt vet test race
+check: fmt vet test race
 
-# 覆盖率：排除 *_gen.go（协议生成物）与 examples/（示例程序），给出总行覆盖率
+# 覆盖率：排除 examples/，给出总行覆盖率
 cover:
 	$(GO) test ./... -coverprofile=coverage.out -covermode=atomic -coverpkg=./...
-	@grep -v -e '_gen\.go' -e '/examples/' coverage.out > coverage.filtered.out
+	@grep -v -e '/examples/' coverage.out > coverage.filtered.out
 	@$(GO) tool cover -func=coverage.filtered.out | tail -1
 	@rm -f coverage.out coverage.filtered.out
 
-# 基准测试（事件分发 / 解码 / API 调用）
+# 基准测试（事件分发 / CQ 编解码 / 消息解析）
 bench:
-	$(GO) test -run '^$$' -bench . -benchmem -benchtime=500ms ./ ./event ./types
-
-spec-fetch:
-	curl -fsSL -o /tmp/milky-protocol-latest.json $(SPEC_URL)
-	@echo "上游 IR 已下载到 /tmp/milky-protocol-latest.json"
-
-spec-check: spec-fetch
-	@diff -u protocol/protocol-$(SPEC_VERSION).json /tmp/milky-protocol-latest.json && echo "IR 与上游一致"
+	$(GO) test -run '^$$' -bench . -benchmem -benchtime=500ms ./ ./event ./types ./segment
 
 clean:
 	$(GO) clean ./...
