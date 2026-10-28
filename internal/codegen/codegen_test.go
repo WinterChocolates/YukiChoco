@@ -57,7 +57,9 @@ func TestGolden(t *testing.T) {
 		if err != nil {
 			t.Fatalf("读取仓库中的 %s: %v", repoPath, err)
 		}
-		if !bytes.Equal(got, want) {
+		// 忽略行尾差异：Windows 上 git 可能以 CRLF 检出（见 .gitattributes），
+		// 生成器始终输出 LF，比较前统一归一化。
+		if !bytes.Equal(normalizeEOL(got), normalizeEOL(want)) {
 			t.Errorf("%s 与 IR 生成结果不一致；请执行 `make generate`", repoPath)
 		}
 	}
@@ -67,6 +69,11 @@ func TestGolden(t *testing.T) {
 	for _, name := range generatedServiceFiles {
 		compare(name, filepath.Join("../../", name))
 	}
+}
+
+// normalizeEOL 把 CRLF 归一化为 LF。
+func normalizeEOL(b []byte) []byte {
+	return bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n"))
 }
 
 // TestIRBaseline 锁定协议基线，防止无意间替换了 IR 文件。

@@ -63,12 +63,21 @@ func Base64URI(data []byte) string {
 }
 
 // FileURI 把本地路径转成 file:// URI（相对路径会被解析为绝对路径）。
+//
+// Windows 盘符路径会被规范化为 file:///C:/dir/a.png（三个斜杠），
+// 避免协议端把 file://C:/... 解析成一个名为 C 的主机。
 func FileURI(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("milky/segment: 解析路径 %q 失败: %w", path, err)
 	}
-	u := url.URL{Scheme: "file", Path: filepath.ToSlash(abs)}
+	slash := filepath.ToSlash(abs)
+	// Windows 绝对路径形如 C:/dir（不带前导斜杠），URL 路径必须补上，
+	// 否则 url.URL 会输出 file://C:/dir 这种错误形式。
+	if !strings.HasPrefix(slash, "/") {
+		slash = "/" + slash
+	}
+	u := url.URL{Scheme: "file", Path: slash}
 	return u.String(), nil
 }
 
@@ -83,24 +92,45 @@ func ReadFileURI(path string) (string, error) {
 }
 
 // normalizeStringURI 处理字符串来源。
+//
+// 判断顺序很关键：Windows 盘符路径（C:\dir\a.png）会被 url.Parse 误认为
+// scheme 为 "c"，所以必须先识别本地路径，再判断 URI。
 func normalizeStringURI(s string) (string, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return "", errors.New("milky/segment: 资源 URI 为空")
 	}
+
+	lower := strings.ToLower(s)
 	for _, prefix := range []string{"file://", "http://", "https://", "base64://"} {
-		if strings.HasPrefix(s, prefix) {
+		if strings.HasPrefix(lower, prefix) {
 			return s, nil
 		}
 	}
-	// 兼容大小写差异与其它协议：只要带 scheme 就原样交给协议端判断。
-	if u, err := url.Parse(s); err == nil && u.Scheme != "" && u.Scheme != "file" {
-		if u.Scheme == "base64" || u.Scheme == "http" || u.Scheme == "https" {
-			return s, nil
-		}
-		return "", fmt.Errorf("milky/segment: 不支持的 URI scheme %q", u.Scheme)
+
+	// 本地路径：Windows 盘符、UNC、POSIX 绝对路径、不含 scheme 的相对路径。
+	if isWindowsDrivePath(s) || strings.HasPrefix(s, `\\`) || strings.HasPrefix(s, "/") || !strings.Contains(s, ":") {
+		return FileURI(s)
 	}
-	return FileURI(s)
+
+	// 其余带 scheme 的形式：明确支持或明确拒绝，不做猜测。
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("milky/segment: 解析 URI %q 失败: %w", s, err)
+	}
+	if u.Scheme == "" {
+		return FileURI(s)
+	}
+	return "", fmt.Errorf("milky/segment: 不支持的 URI scheme %q", u.Scheme)
+}
+
+// isWindowsDrivePath 报告 s 是否是盘符路径（C: 开头，且第二个字符是冒号）。
+func isWindowsDrivePath(s string) bool {
+	if len(s) < 2 || s[1] != ':' {
+		return false
+	}
+	c := s[0]
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
 // readAtMost 读取最多 limit 字节，超出则报错而不是静默截断。

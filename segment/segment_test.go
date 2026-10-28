@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -200,5 +201,44 @@ func TestImageFromReaderAndURL(t *testing.T) {
 	seg = segment.ImageFromURL("https://example.com/a.png")
 	if !strings.Contains(mustJSON(t, seg), `"uri":"https://example.com/a.png"`) {
 		t.Fatalf("ImageFromURL = %s", mustJSON(t, seg))
+	}
+}
+
+// TestURILocalPaths 覆盖各平台的本地路径识别（Windows 盘符不应被当成 scheme）。
+func TestURILocalPaths(t *testing.T) {
+	// 相对路径在任何平台都应转成 file:// 绝对路径。
+	uri, err := segment.URI("relative/a.png")
+	if err != nil {
+		t.Fatalf("URI(相对路径): %v", err)
+	}
+	if !strings.HasPrefix(uri, "file:///") {
+		t.Fatalf("相对路径应转成 file:/// 形式，得到 %s", uri)
+	}
+
+	// POSIX 绝对路径。
+	uri, err = segment.URI("/tmp/a.png")
+	if err != nil {
+		t.Fatalf("URI(/tmp/a.png): %v", err)
+	}
+	if !strings.HasPrefix(uri, "file:///") {
+		t.Fatalf("绝对路径应转成 file:/// 形式，得到 %s", uri)
+	}
+
+	if runtime.GOOS != "windows" {
+		return
+	}
+	// Windows 盘符路径：反斜杠与正斜杠两种写法都不能被当成 URI scheme。
+	for _, in := range []string{
+		`C:\temp\a.png`,
+		"C:/temp/a.png",
+		"c:/temp/a.png",
+	} {
+		uri, err := segment.URI(in)
+		if err != nil {
+			t.Fatalf("URI(%s): %v", in, err)
+		}
+		if !strings.HasPrefix(strings.ToLower(uri), "file:///c:/") {
+			t.Fatalf("URI(%s) = %s，期望 file:///C:/... 形式", in, uri)
+		}
 	}
 }

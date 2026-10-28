@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **Windows**：`segment.URI` 把盘符路径（`C:\dir\a.png`）误判为 URI scheme `c` 而报错；
+  现按「Windows 盘符 / UNC / POSIX 绝对路径 / 无 scheme 相对路径」优先识别本地路径。
+- **Windows**：`segment.FileURI` 输出 `file://C:/dir/a.png`（缺第三个斜杠），
+  会被解析成主机名 `C`；现统一输出 `file:///C:/dir/a.png`。
+- **CI（Windows）**：仓库以 CRLF 检出时 `TestGolden` 对全部生成物误报不一致；
+  新增 `.gitattributes`（`* text=auto eol=lf`）并在比较前归一化行尾。
+- 测试补充：`TestURILocalPaths` 覆盖 Windows 盘符（`C:\`、`C:/`、`c:/`）、
+  相对路径与 POSIX 绝对路径。
+
 ## [0.1.0] - 2026-10-28
 
 首个可用版本：对齐 Milky 1.3（`1.3.0`），覆盖 65 个端点、21 个事件、24 种消息段。

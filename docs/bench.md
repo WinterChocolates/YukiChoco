@@ -68,7 +68,7 @@ go test -run '^$' -bench . -benchmem -benchtime=500ms ./ ./event ./types
 make cover   # 排除 *_gen.go 与 examples/ 后的总行覆盖率
 ```
 
-当前：**88.1%**（NFR-7 要求 ≥ 85%）。
+当前：**86.2%**（NFR-7 要求 ≥ 85%）。
 
 ## 如何避免性能回归
 
